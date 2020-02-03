@@ -76,6 +76,13 @@ directory. Example:
 cargo +nightly build --out-dir=out -Z unstable-options
 ```
 
+This can also be specified in `.cargo/config` files.
+
+```toml
+[build]
+out-dir = "out"
+```
+
 ### doctest-xcompile
 * Tracking Issue: [#7040](https://github.com/rust-lang/cargo/issues/7040)
 * Tracking Rustc Issue: [#64245](https://github.com/rust-lang/rust/issues/64245)
@@ -148,26 +155,6 @@ when left unspecified, defaults to the name of the profile. For example:
 inherits = "release"
 dir-name = "lto"  # Emits to target/lto instead of target/release-lto
 lto = true
-```
-
-
-### Config Profiles
-* Tracking Issue: [rust-lang/rust#48683](https://github.com/rust-lang/rust/issues/48683)
-* RFC: [#2282](https://github.com/rust-lang/rfcs/blob/master/text/2282-profile-dependencies.md)
-
-Profiles can be specified in `.cargo/config` files. The `-Z config-profile`
-command-line flag is required to use this feature. The format is the same as
-in a `Cargo.toml` manifest. If found in multiple config files, settings will
-be merged using the regular [config hierarchy](config.md#hierarchical-structure).
-Config settings take precedence over manifest settings.
-
-```toml
-[profile.dev]
-opt-level = 3
-```
-
-```
-cargo +nightly build -Z config-profile
 ```
 
 
