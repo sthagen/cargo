@@ -676,6 +676,7 @@ impl<'a, 'cfg> DrainState<'a, 'cfg> {
         }
 
         let time_elapsed = util::elapsed(cx.bcx.config.creation_time().elapsed());
+        self.timings.finished(cx.bcx, &error)?;
 
         if let Some(e) = error {
             Err(e)
@@ -687,7 +688,6 @@ impl<'a, 'cfg> DrainState<'a, 'cfg> {
             if !cx.bcx.build_config.build_plan {
                 cx.bcx.config.shell().status("Finished", message)?;
             }
-            self.timings.finished(cx.bcx)?;
             Ok(())
         } else {
             debug!("queue: {:#?}", self.queue);
@@ -835,11 +835,15 @@ impl<'a, 'cfg> DrainState<'a, 'cfg> {
         &mut self,
         msg: Option<&str>,
         unit: &Unit<'a>,
-        cx: &mut Context<'_, '_>,
+        cx: &mut Context<'a, '_>,
     ) -> CargoResult<()> {
         let outputs = cx.build_script_outputs.lock().unwrap();
+        let metadata = match cx.find_build_script_metadata(*unit) {
+            Some(metadata) => metadata,
+            None => return Ok(()),
+        };
         let bcx = &mut cx.bcx;
-        if let Some(output) = outputs.get(&(unit.pkg.package_id(), unit.kind)) {
+        if let Some(output) = outputs.get(unit.pkg.package_id(), metadata) {
             if !output.warnings.is_empty() {
                 if let Some(msg) = msg {
                     writeln!(bcx.config.shell().err(), "{}\n", msg)?;
