@@ -341,6 +341,8 @@ pub struct CliUnstable {
     pub doctest_xcompile: bool,
     pub panic_abort_tests: bool,
     pub jobserver_per_rustc: bool,
+    pub features: Option<Vec<String>>,
+    pub crate_versions: bool,
 }
 
 impl CliUnstable {
@@ -380,6 +382,13 @@ impl CliUnstable {
             }
         }
 
+        fn parse_features(value: Option<&str>) -> Vec<String> {
+            match value {
+                None => Vec::new(),
+                Some(v) => v.split(',').map(|s| s.to_string()).collect(),
+            }
+        }
+
         // Asserts that there is no argument to the flag.
         fn parse_empty(key: &str, value: Option<&str>) -> CargoResult<bool> {
             if let Some(v) = value {
@@ -409,6 +418,8 @@ impl CliUnstable {
             "doctest-xcompile" => self.doctest_xcompile = parse_empty(k, v)?,
             "panic-abort-tests" => self.panic_abort_tests = parse_empty(k, v)?,
             "jobserver-per-rustc" => self.jobserver_per_rustc = parse_empty(k, v)?,
+            "features" => self.features = Some(parse_features(v)),
+            "crate-versions" => self.crate_versions = parse_empty(k, v)?,
             _ => bail!("unknown `-Z` flag specified: {}", k),
         }
 

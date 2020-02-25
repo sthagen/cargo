@@ -120,9 +120,7 @@ use std::str;
 use std::time::{self, Duration};
 use std::usize;
 
-use cargo;
 use cargo::util::{is_ci, CargoResult, ProcessBuilder, ProcessError, Rustc};
-use filetime;
 use serde_json::{self, Value};
 use url::Url;
 
@@ -1645,6 +1643,7 @@ fn substitute_macros(input: &str) -> String {
         ("[FINISHED]", "    Finished"),
         ("[ERROR]", "error:"),
         ("[WARNING]", "warning:"),
+        ("[NOTE]", "note:"),
         ("[DOCUMENTING]", " Documenting"),
         ("[FRESH]", "       Fresh"),
         ("[UPDATING]", "    Updating"),
@@ -1666,7 +1665,6 @@ fn substitute_macros(input: &str) -> String {
         ("[IGNORED]", "     Ignored"),
         ("[INSTALLED]", "   Installed"),
         ("[REPLACED]", "    Replaced"),
-        ("[NOTE]", "        Note"),
     ];
     let mut result = input.to_owned();
     for &(pat, subst) in &macros {
@@ -1741,6 +1739,10 @@ fn _process(t: &OsStr) -> cargo::util::ProcessBuilder {
         .env_remove("GIT_COMMITTER_NAME")
         .env_remove("GIT_COMMITTER_EMAIL")
         .env_remove("MSYSTEM"); // assume cmd.exe everywhere on windows
+    if cfg!(target_os = "macos") {
+        // Work-around a bug in macOS 10.15, see `link_or_copy` for details.
+        p.env("__CARGO_COPY_DONT_LINK_DO_NOT_USE_THIS", "1");
+    }
     p
 }
 

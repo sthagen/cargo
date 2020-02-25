@@ -465,10 +465,90 @@ The config values are first loaded from the include path, and then the config
 file's own values are merged on top of it.
 
 This can be paired with [config-cli](#config-cli) to specify a file to load
-from the command-line:
+from the command-line. Pass a path to a config file as the argument to
+`--config`:
 
 ```console
-cargo +nightly -Zunstable-options -Zconfig-include --config 'include="somefile.toml"' build
+cargo +nightly -Zunstable-options -Zconfig-include --config somefile.toml build
 ```
 
 CLI paths are relative to the current working directory.
+
+## Features
+* Tracking Issues:
+  * [itarget #7914](https://github.com/rust-lang/cargo/issues/7914)
+  * [build_dep #7915](https://github.com/rust-lang/cargo/issues/7915)
+  * [dev_dep #7916](https://github.com/rust-lang/cargo/issues/7916)
+
+The `-Zfeatures` option causes Cargo to use a new feature resolver that can
+resolve features differently from before. It takes a comma separated list of
+options to indicate which new behaviors to enable. With no options, it should
+behave the same as without the flag.
+
+```console
+cargo +nightly -Zfeatures=itarget,build_dep
+```
+
+The available options are:
+
+* `itarget` — Ignores features for target-specific dependencies for targets
+  that don't match the current compile target. For example:
+
+  ```toml
+  [dependency.common]
+  version = "1.0"
+  features = ["f1"]
+
+  [target.'cfg(windows)'.dependencies.common]
+  version = "1.0"
+  features = ["f2"]
+  ```
+
+  When building this example for a non-Windows platform, the `f2` feature will
+  *not* be enabled.
+
+* `build_dep` — Prevents features enabled on build dependencies from being
+  enabled for normal dependencies. For example:
+
+  ```toml
+  [dependencies]
+  log = "0.4"
+
+  [build-dependencies]
+  log = {version = "0.4", features=['std']}
+  ```
+
+  When building the build script, the `log` crate will be built with the `std`
+  feature. When building the library of your package, it will not enable the
+  feature.
+
+* `dev_dep` — Prevents features enabled on dev dependencies from being enabled
+  for normal dependencies. For example:
+
+  ```toml
+  [dependencies]
+  serde = {version = "1.0", default-features = false}
+
+  [dev-dependencies]
+  serde = {version = "1.0", features = ["std"]}
+  ```
+
+  In this example, the library will normally link against `serde` without the
+  `std` feature. However, when built as a test or example, it will include the
+  `std` feature.
+
+  This mode is ignored if you are building any test, bench, or example. That
+  is, dev dependency features will still be unified if you run commands like
+  `cargo test` or `cargo build --all-targets`.
+
+* `all` — Enable all feature options (`itarget,build_dep,dev_dep`).
+
+* `compare` — This option compares the resolved features to the old resolver,
+  and will print any differences.
+
+### crate-versions
+* Tracking Issue: [#7907](https://github.com/rust-lang/cargo/issues/7907)
+
+The `-Z crate-versions` flag will make `cargo doc` include appropriate crate versions for the current crate and all of its dependencies (unless `--no-deps` was provided) in the compiled documentation.
+
+You can find an example screenshot for the cargo itself in the tracking issue.

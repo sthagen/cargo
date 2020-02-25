@@ -28,7 +28,7 @@ use lazycell::LazyCell;
 use log::debug;
 
 pub use self::build_config::{BuildConfig, CompileMode, MessageFormat};
-pub use self::build_context::{BuildContext, FileFlavor, TargetInfo};
+pub use self::build_context::{BuildContext, FileFlavor, RustcTargetData, TargetInfo};
 use self::build_plan::BuildPlan;
 pub use self::compilation::{Compilation, Doctest};
 pub use self::compile_kind::{CompileKind, CompileTarget};
@@ -44,7 +44,7 @@ pub use crate::core::compiler::unit::{Unit, UnitInterner};
 use crate::core::manifest::TargetSourcePath;
 use crate::core::profiles::{Lto, PanicStrategy, Profile};
 use crate::core::{Edition, Feature, InternedString, PackageId, Target};
-use crate::util::errors::{self, CargoResult, CargoResultExt, Internal, ProcessError};
+use crate::util::errors::{self, CargoResult, CargoResultExt, ProcessError, VerboseError};
 use crate::util::machine_message::Message;
 use crate::util::{self, machine_message, ProcessBuilder};
 use crate::util::{internal, join_paths, paths, profile};
@@ -262,7 +262,7 @@ fn rustc<'a, 'cfg>(
             }
         }
 
-        fn internal_if_simple_exit_code(err: Error) -> Error {
+        fn verbose_if_simple_exit_code(err: Error) -> Error {
             // If a signal on unix (`code == None`) or an abnormal termination
             // on Windows (codes like `0xC0000409`), don't hide the error details.
             match err
@@ -270,7 +270,7 @@ fn rustc<'a, 'cfg>(
                 .as_ref()
                 .and_then(|perr| perr.exit.and_then(|e| e.code()))
             {
-                Some(n) if errors::is_simple_exit_code(n) => Internal::new(err).into(),
+                Some(n) if errors::is_simple_exit_code(n) => VerboseError::new(err).into(),
                 _ => err,
             }
         }
@@ -288,7 +288,7 @@ fn rustc<'a, 'cfg>(
                 &mut |line| on_stdout_line(state, line, package_id, &target),
                 &mut |line| on_stderr_line(state, line, package_id, &target, &mut output_options),
             )
-            .map_err(internal_if_simple_exit_code)
+            .map_err(verbose_if_simple_exit_code)
             .chain_err(|| format!("could not compile `{}`.", name))?;
         }
 
@@ -302,8 +302,7 @@ fn rustc<'a, 'cfg>(
                     .replace(&real_name, &crate_name),
             );
             if src.exists() && src.file_name() != dst.file_name() {
-                fs::rename(&src, &dst)
-                    .chain_err(|| internal(format!("could not rename crate {:?}", src)))?;
+                fs::rename(&src, &dst).chain_err(|| format!("could not rename crate {:?}", src))?;
             }
         }
 
@@ -559,6 +558,7 @@ fn rustdoc<'a, 'cfg>(cx: &mut Context<'a, 'cfg>, unit: &Unit<'a>) -> CargoResult
     let mut rustdoc = cx.compilation.rustdoc_process(unit.pkg, unit.target)?;
     rustdoc.inherit_jobserver(&cx.jobserver);
     rustdoc.arg("--crate-name").arg(&unit.target.crate_name());
+    add_crate_versions_if_requested(bcx, unit, &mut rustdoc);
     add_path_args(bcx, unit, &mut rustdoc);
     add_cap_lints(bcx, unit, &mut rustdoc);
 
@@ -623,6 +623,21 @@ fn rustdoc<'a, 'cfg>(cx: &mut Context<'a, 'cfg>, unit: &Unit<'a>) -> CargoResult
             .chain_err(|| format!("Could not document `{}`.", name))?;
         Ok(())
     }))
+}
+
+fn add_crate_versions_if_requested(
+    bcx: &BuildContext<'_, '_>,
+    unit: &Unit<'_>,
+    rustdoc: &mut ProcessBuilder,
+) {
+    if !bcx.config.cli_unstable().crate_versions {
+        return;
+    }
+    rustdoc
+        .arg("-Z")
+        .arg("unstable-options")
+        .arg("--crate-version")
+        .arg(&unit.pkg.version().to_string());
 }
 
 // The path that we pass to rustc is actually fairly important because it will
@@ -885,6 +900,23 @@ fn build_base_args<'a, 'cfg>(
         // RUSTC_BOOTSTRAP allows unstable features on stable.
         cmd.arg("-Zforce-unstable-if-unmarked")
             .env("RUSTC_BOOTSTRAP", "1");
+    }
+
+    // Add `CARGO_BIN_` environment variables for building tests.
+    if unit.target.is_test() || unit.target.is_bench() {
+        for bin_target in unit
+            .pkg
+            .manifest()
+            .targets()
+            .iter()
+            .filter(|target| target.is_bin())
+        {
+            let exe_path = cx
+                .files()
+                .bin_link_for_target(bin_target, unit.kind, cx.bcx)?;
+            let key = format!("CARGO_BIN_EXE_{}", bin_target.name());
+            cmd.env(&key, exe_path);
+        }
     }
     Ok(())
 }

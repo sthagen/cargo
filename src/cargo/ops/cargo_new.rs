@@ -15,8 +15,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::str::{from_utf8, FromStr};
 
-use toml;
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum VersionControl {
     Git,
@@ -362,6 +360,11 @@ pub fn new(opts: &NewOptions, config: &Config) -> CargoResult<()> {
 }
 
 pub fn init(opts: &NewOptions, config: &Config) -> CargoResult<()> {
+    // This is here just as a random location to exercise the internal error handling.
+    if std::env::var_os("__CARGO_TEST_INTERNAL_ERROR").is_some() {
+        return Err(crate::util::internal("internal error test"));
+    }
+
     let path = &opts.path;
 
     if fs::metadata(&path.join("Cargo.toml")).is_ok() {

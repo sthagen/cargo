@@ -1,6 +1,5 @@
 //! Tests for the `cargo test` command.
 
-use cargo;
 use cargo_test_support::paths::CargoPathExt;
 use cargo_test_support::registry::Package;
 use cargo_test_support::{
@@ -3664,6 +3663,8 @@ fn cargo_test_doctest_xcompile_ignores() {
         // -Zdoctest-xcompile is unstable
         return;
     }
+    // -Zdoctest-xcompile also enables --enable-per-target-ignores which
+    // allows the ignore-TARGET syntax.
     let p = project()
         .file("Cargo.toml", &basic_lib_manifest("foo"))
         .file(
@@ -3713,7 +3714,7 @@ fn cargo_test_doctest_xcompile_ignores() {
 
 #[cargo_test]
 fn cargo_test_doctest_xcompile() {
-    if cross_compile::disabled() {
+    if !cross_compile::can_run_on_host() {
         return;
     }
     if !is_nightly() {
@@ -3753,7 +3754,7 @@ fn cargo_test_doctest_xcompile() {
 
 #[cargo_test]
 fn cargo_test_doctest_xcompile_runner() {
-    if cross_compile::disabled() {
+    if !cross_compile::can_run_on_host() {
         return;
     }
     if !is_nightly() {
@@ -3789,9 +3790,10 @@ fn cargo_test_doctest_xcompile_runner() {
         config,
         format!(
             r#"
-[target.'cfg(target_arch = "x86")']
+[target.'cfg(target_arch = "{}")']
 runner = "{}"
 "#,
+            cross_compile::alternate_arch(),
             runner_str
         ),
     )
@@ -3801,14 +3803,17 @@ runner = "{}"
         .file("Cargo.toml", &basic_lib_manifest("foo"))
         .file(
             "src/lib.rs",
-            r#"
-            ///```
-            ///assert!(cfg!(target_arch = "x86"));
-            ///```
-            pub fn foo() -> u8 {
-                4
-            }
-            "#,
+            &format!(
+                r#"
+                ///```
+                ///assert!(cfg!(target_arch = "{}"));
+                ///```
+                pub fn foo() -> u8 {{
+                    4
+                }}
+                "#,
+                cross_compile::alternate_arch()
+            ),
         )
         .build();
 
@@ -3830,7 +3835,7 @@ runner = "{}"
 
 #[cargo_test]
 fn cargo_test_doctest_xcompile_no_runner() {
-    if cross_compile::disabled() {
+    if !cross_compile::can_run_on_host() {
         return;
     }
     if !is_nightly() {
@@ -3842,15 +3847,17 @@ fn cargo_test_doctest_xcompile_no_runner() {
         .file("Cargo.toml", &basic_lib_manifest("foo"))
         .file(
             "src/lib.rs",
-            r#"
-
-            ///```
-            ///assert!(cfg!(target_arch = "x86"));
-            ///```
-            pub fn foo() -> u8 {
-                4
-            }
-            "#,
+            &format!(
+                r#"
+                ///```
+                ///assert!(cfg!(target_arch = "{}"));
+                ///```
+                pub fn foo() -> u8 {{
+                    4
+                }}
+                "#,
+                cross_compile::alternate_arch()
+            ),
         )
         .build();
 
@@ -3994,4 +4001,51 @@ fn panic_abort_test_profile_inherits() {
         .masquerade_as_nightly_cargo()
         .with_status(0)
         .run();
+}
+
+#[cargo_test]
+fn bin_env_for_test() {
+    // Test for the `CARGO_BIN_` environment variables for tests.
+    //
+    // Note: The Unicode binary uses a `[[bin]]` definition because different
+    // filesystems normalize utf-8 in different ways. For example, HFS uses
+    // "gru\u{308}ßen" and APFS uses "gr\u{fc}ßen". Defining it in TOML forces
+    // one form to be used.
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.1.0"
+                edition = "2018"
+
+                [[bin]]
+                name = 'grüßen'
+                path = 'src/bin/grussen.rs'
+            "#,
+        )
+        .file("src/bin/foo.rs", "fn main() {}")
+        .file("src/bin/with-dash.rs", "fn main() {}")
+        .file("src/bin/grussen.rs", "fn main() {}")
+        .build();
+
+    let bin_path = |name| p.bin(name).to_string_lossy().replace("\\", "\\\\");
+    p.change_file(
+        "tests/check_env.rs",
+        &r#"
+            #[test]
+            fn run_bins() {
+                assert_eq!(env!("CARGO_BIN_EXE_foo"), "<FOO_PATH>");
+                assert_eq!(env!("CARGO_BIN_EXE_with-dash"), "<WITH_DASH_PATH>");
+                assert_eq!(env!("CARGO_BIN_EXE_grüßen"), "<GRÜSSEN_PATH>");
+            }
+        "#
+        .replace("<FOO_PATH>", &bin_path("foo"))
+        .replace("<WITH_DASH_PATH>", &bin_path("with-dash"))
+        .replace("<GRÜSSEN_PATH>", &bin_path("grüßen")),
+    );
+
+    p.cargo("test --test check_env").run();
+    p.cargo("check --test check_env").run();
 }

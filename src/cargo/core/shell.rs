@@ -1,7 +1,6 @@
 use std::fmt;
 use std::io::prelude::*;
 
-use atty;
 use termcolor::Color::{Cyan, Green, Red, Yellow};
 use termcolor::{self, Color, ColorSpec, StandardStream, WriteColor};
 
@@ -228,6 +227,11 @@ impl Shell {
         }
     }
 
+    /// Prints a cyan 'note' message.
+    pub fn note<T: fmt::Display>(&mut self, message: T) -> CargoResult<()> {
+        self.print(&"note", Some(&message), Cyan, false)
+    }
+
     /// Updates the verbosity of the shell.
     pub fn set_verbosity(&mut self, verbosity: Verbosity) {
         self.verbosity = verbosity;
@@ -377,11 +381,8 @@ impl ColorChoice {
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
 mod imp {
-    use std::mem;
-
-    use libc;
-
     use super::Shell;
+    use std::mem;
 
     pub fn stderr_width() -> Option<usize> {
         unsafe {

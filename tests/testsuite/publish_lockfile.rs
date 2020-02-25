@@ -1,6 +1,5 @@
 //! Tests for including `Cargo.lock` when publishing/packaging.
 
-use std;
 use std::fs::File;
 
 use cargo_test_support::registry::Package;
@@ -85,6 +84,7 @@ fn package_lockfile() {
             "\
 Cargo.lock
 Cargo.toml
+Cargo.toml.orig
 src/main.rs
 ",
         )
@@ -114,6 +114,7 @@ fn package_lockfile_git_repo() {
 .cargo_vcs_info.json
 Cargo.lock
 Cargo.toml
+Cargo.toml.orig
 src/main.rs
 ",
         )
@@ -123,10 +124,11 @@ src/main.rs
         .with_stderr(
             "\
 [PACKAGING] foo v0.0.1 ([..])
-[ARCHIVING] Cargo.toml
-[ARCHIVING] src/main.rs
 [ARCHIVING] .cargo_vcs_info.json
 [ARCHIVING] Cargo.lock
+[ARCHIVING] Cargo.toml
+[ARCHIVING] Cargo.toml.orig
+[ARCHIVING] src/main.rs
 [VERIFYING] foo v0.0.1 ([..])
 [COMPILING] foo v0.0.1 ([..])
 [RUNNING] `rustc --crate-name foo src/main.rs [..]
@@ -221,9 +223,10 @@ fn note_resolve_changes() {
         .with_stderr_unordered(
             "\
 [PACKAGING] foo v0.0.1 ([..])
-[ARCHIVING] Cargo.toml
-[ARCHIVING] src/main.rs
 [ARCHIVING] Cargo.lock
+[ARCHIVING] Cargo.toml
+[ARCHIVING] Cargo.toml.orig
+[ARCHIVING] src/main.rs
 [UPDATING] `[..]` index
 [NOTE] package `mutli v0.1.0` added to the packaged Cargo.lock file, was originally sourced from `[..]/foo/mutli`
 [NOTE] package `patched v1.0.0` added to the packaged Cargo.lock file, was originally sourced from `[..]/foo/patched`
@@ -294,8 +297,8 @@ fn no_warn_workspace_extras() {
         .cwd("a")
         .with_stderr(
             "\
-[PACKAGING] a v0.1.0 ([..])
 [UPDATING] `[..]` index
+[PACKAGING] a v0.1.0 ([..])
 ",
         )
         .run();
@@ -325,10 +328,10 @@ fn warn_package_with_yanked() {
     p.cargo("package --no-verify")
         .with_stderr(
             "\
-[PACKAGING] foo v0.0.1 ([..])
 [UPDATING] `[..]` index
 [WARNING] package `bar v0.1.0` in Cargo.lock is yanked in registry \
     `crates.io`, consider updating to a version that is not yanked
+[PACKAGING] foo v0.0.1 ([..])
 ",
         )
         .run();
@@ -426,6 +429,7 @@ fn ignore_lockfile() {
 .cargo_vcs_info.json
 Cargo.lock
 Cargo.toml
+Cargo.toml.orig
 src/main.rs
 ",
         )
@@ -435,10 +439,11 @@ src/main.rs
         .with_stderr(
             "\
 [PACKAGING] foo v0.0.1 ([..])
-[ARCHIVING] Cargo.toml
-[ARCHIVING] src/main.rs
 [ARCHIVING] .cargo_vcs_info.json
 [ARCHIVING] Cargo.lock
+[ARCHIVING] Cargo.toml
+[ARCHIVING] Cargo.toml.orig
+[ARCHIVING] src/main.rs
 [VERIFYING] foo v0.0.1 ([..])
 [COMPILING] foo v0.0.1 ([..])
 [RUNNING] `rustc --crate-name foo src/main.rs [..]
@@ -463,10 +468,11 @@ fn ignore_lockfile_inner() {
         .with_stderr(
             "\
 [PACKAGING] bar v0.0.1 ([..])
-[ARCHIVING] Cargo.toml
-[ARCHIVING] src/main.rs
 [ARCHIVING] .cargo_vcs_info.json
 [ARCHIVING] Cargo.lock
+[ARCHIVING] Cargo.toml
+[ARCHIVING] Cargo.toml.orig
+[ARCHIVING] src/main.rs
 ",
         )
         .run();

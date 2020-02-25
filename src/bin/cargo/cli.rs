@@ -1,9 +1,6 @@
-use clap;
-
-use clap::{AppSettings, Arg, ArgMatches};
-
 use cargo::core::features;
 use cargo::{self, CliResult, Config};
+use clap::{AppSettings, Arg, ArgMatches};
 
 use super::commands;
 use super::list_commands;
@@ -38,6 +35,7 @@ Available unstable (nightly-only) flags:
     -Z unstable-options -- Allow the usage of unstable options
     -Z timings          -- Display concurrency information
     -Z doctest-xcompile -- Compile and run doctests for non-host target using runner config
+    -Z crate-versions   -- Add crate versions to generated docs
 
 Run with 'cargo -Z [FLAG] [SUBCOMMAND]'"
         );
@@ -154,7 +152,7 @@ fn expand_aliases(
                 // capture those global options now.
                 // Note that an alias to an external command will not receive
                 // these arguments. That may be confusing, but such is life.
-                let global_args = GlobalArgs::new(&args);
+                let global_args = GlobalArgs::new(args);
                 let new_args = cli()
                     .setting(AppSettings::NoBinaryName)
                     .get_matches_from_safe(alias)?;

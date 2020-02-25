@@ -1,6 +1,5 @@
 //! Tests for git support.
 
-use git2;
 use std::env;
 use std::fs::{self, File};
 use std::io::prelude::*;
@@ -2314,6 +2313,7 @@ fn include_overrides_gitignore() {
         .with_stdout(
             "\
 Cargo.toml
+Cargo.toml.orig
 ignored.txt
 src/lib.rs
 ",

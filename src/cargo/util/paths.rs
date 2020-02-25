@@ -8,26 +8,21 @@ use std::path::{Component, Path, PathBuf};
 
 use filetime::FileTime;
 
-use crate::util::errors::{CargoResult, CargoResultExt, Internal};
+use crate::util::errors::{CargoResult, CargoResultExt};
 
 pub fn join_paths<T: AsRef<OsStr>>(paths: &[T], env: &str) -> CargoResult<OsString> {
-    let err = match env::join_paths(paths.iter()) {
-        Ok(paths) => return Ok(paths),
-        Err(e) => e,
-    };
-    let paths = paths.iter().map(Path::new).collect::<Vec<_>>();
-    let err = anyhow::Error::from(err);
-    let explain = Internal::new(anyhow::format_err!(
-        "failed to join path array: {:?}",
-        paths
-    ));
-    let err = anyhow::Error::from(err.context(explain));
-    let more_explain = format!(
-        "failed to join search paths together\n\
-         Does ${} have an unterminated quote character?",
-        env
-    );
-    Err(err.context(more_explain).into())
+    env::join_paths(paths.iter())
+        .chain_err(|| {
+            let paths = paths.iter().map(Path::new).collect::<Vec<_>>();
+            format!("failed to join path array: {:?}", paths)
+        })
+        .chain_err(|| {
+            format!(
+                "failed to join search paths together\n\
+                     Does ${} have an unterminated quote character?",
+                env
+            )
+        })
 }
 
 pub fn dylib_path_envvar() -> &'static str {
@@ -383,6 +378,17 @@ fn _link_or_copy(src: &Path, dst: &Path) -> CargoResult<()> {
             src
         };
         symlink(src, dst)
+    } else if env::var_os("__CARGO_COPY_DONT_LINK_DO_NOT_USE_THIS").is_some() {
+        // This is a work-around for a bug in macOS 10.15. When running on
+        // APFS, there seems to be a strange race condition with
+        // Gatekeeper where it will forcefully kill a process launched via
+        // `cargo run` with SIGKILL. Copying seems to avoid the problem.
+        // This shouldn't affect anyone except Cargo's test suite because
+        // it is very rare, and only seems to happen under heavy load and
+        // rapidly creating lots of executables and running them.
+        // See https://github.com/rust-lang/cargo/issues/7821 for the
+        // gory details.
+        fs::copy(src, dst).map(|_| ())
     } else {
         fs::hard_link(src, dst)
     };
