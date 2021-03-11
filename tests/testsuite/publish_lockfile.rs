@@ -48,14 +48,16 @@ fn deprecated() {
         .build();
     p.cargo("package")
         .masquerade_as_nightly_cargo()
+        .with_status(101)
         .with_stderr(
             "\
-[PACKAGING] foo v0.1.0 ([..])
-[VERIFYING] foo v0.1.0 ([..])
-[WARNING] The `publish-lockfile` feature is deprecated and currently has no effect. \
-    It may be removed in a future version.
-[COMPILING] foo v0.1.0 ([..])
-[FINISHED] dev [..]
+[ERROR] failed to parse manifest at [..]
+
+Caused by:
+  the cargo feature `publish-lockfile` has been removed
+  Remove the feature from Cargo.toml to remove this error.
+  The publish-lockfile key [..]
+  See [..]
 ",
         )
         .run();
@@ -162,9 +164,9 @@ fn lock_file_and_workspace() {
         .file(
             "Cargo.toml",
             r#"
-            [workspace]
-            members = ["foo"]
-        "#,
+                [workspace]
+                members = ["foo"]
+            "#,
         )
         .file("foo/Cargo.toml", &pl_manifest("foo", "0.0.1", ""))
         .file("foo/src/main.rs", "fn main() {}")
@@ -297,8 +299,8 @@ fn no_warn_workspace_extras() {
         .cwd("a")
         .with_stderr(
             "\
-[UPDATING] `[..]` index
 [PACKAGING] a v0.1.0 ([..])
+[UPDATING] `[..]` index
 ",
         )
         .run();
@@ -328,10 +330,10 @@ fn warn_package_with_yanked() {
     p.cargo("package --no-verify")
         .with_stderr(
             "\
+[PACKAGING] foo v0.0.1 ([..])
 [UPDATING] `[..]` index
 [WARNING] package `bar v0.1.0` in Cargo.lock is yanked in registry \
     `crates.io`, consider updating to a version that is not yanked
-[PACKAGING] foo v0.0.1 ([..])
 ",
         )
         .run();
@@ -469,6 +471,7 @@ fn ignore_lockfile_inner() {
             "\
 [PACKAGING] bar v0.0.1 ([..])
 [ARCHIVING] .cargo_vcs_info.json
+[ARCHIVING] .gitignore
 [ARCHIVING] Cargo.lock
 [ARCHIVING] Cargo.toml
 [ARCHIVING] Cargo.toml.orig

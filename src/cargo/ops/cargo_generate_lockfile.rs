@@ -5,7 +5,7 @@ use termcolor::Color::{self, Cyan, Green, Red};
 
 use crate::core::registry::PackageRegistry;
 use crate::core::resolver::ResolveOpts;
-use crate::core::PackageId;
+use crate::core::{PackageId, PackageIdSpec};
 use crate::core::{Resolve, SourceId, Workspace};
 use crate::ops;
 use crate::util::config::Config;
@@ -17,11 +17,12 @@ pub struct UpdateOptions<'a> {
     pub precise: Option<&'a str>,
     pub aggressive: bool,
     pub dry_run: bool,
+    pub workspace: bool,
 }
 
 pub fn generate_lockfile(ws: &Workspace<'_>) -> CargoResult<()> {
     let mut registry = PackageRegistry::new(ws.config())?;
-    let resolve = ops::resolve_with_previous(
+    let mut resolve = ops::resolve_with_previous(
         &mut registry,
         ws,
         &ResolveOpts::everything(),
@@ -30,7 +31,7 @@ pub fn generate_lockfile(ws: &Workspace<'_>) -> CargoResult<()> {
         &[],
         true,
     )?;
-    ops::write_pkg_lockfile(ws, &resolve)?;
+    ops::write_pkg_lockfile(ws, &mut resolve)?;
     Ok(())
 }
 
@@ -78,7 +79,10 @@ pub fn update_lockfile(ws: &Workspace<'_>, opts: &UpdateOptions<'_>) -> CargoRes
     let mut to_avoid = HashSet::new();
 
     if opts.to_update.is_empty() {
-        to_avoid.extend(previous_resolve.iter());
+        if !opts.workspace {
+            to_avoid.extend(previous_resolve.iter());
+            to_avoid.extend(previous_resolve.unused_patches());
+        }
     } else {
         let mut sources = Vec::new();
         for name in opts.to_update.iter() {
@@ -102,12 +106,17 @@ pub fn update_lockfile(ws: &Workspace<'_>, opts: &UpdateOptions<'_>) -> CargoRes
                     None => dep.source_id().with_precise(None),
                 });
             }
+            if let Ok(unused_id) =
+                PackageIdSpec::query_str(name, previous_resolve.unused_patches().iter().cloned())
+            {
+                to_avoid.insert(unused_id);
+            }
         }
 
         registry.add_sources(sources)?;
     }
 
-    let resolve = ops::resolve_with_previous(
+    let mut resolve = ops::resolve_with_previous(
         &mut registry,
         ws,
         &ResolveOpts::everything(),
@@ -147,7 +156,7 @@ pub fn update_lockfile(ws: &Workspace<'_>, opts: &UpdateOptions<'_>) -> CargoRes
             .shell()
             .warn("not updating lockfile due to dry run")?;
     } else {
-        ops::write_pkg_lockfile(ws, &resolve)?;
+        ops::write_pkg_lockfile(ws, &mut resolve)?;
     }
     return Ok(());
 

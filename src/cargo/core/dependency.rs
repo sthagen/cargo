@@ -4,11 +4,12 @@ use semver::ReqParseError;
 use semver::VersionReq;
 use serde::ser;
 use serde::Serialize;
+use std::path::PathBuf;
 use std::rc::Rc;
 
-use crate::core::interning::InternedString;
 use crate::core::{PackageId, SourceId, Summary};
 use crate::util::errors::{CargoResult, CargoResultExt};
+use crate::util::interning::InternedString;
 use crate::util::Config;
 
 /// Information about a dependency requested by a Cargo manifest.
@@ -61,6 +62,10 @@ struct SerializedDependency<'a> {
     /// The registry URL this dependency is from.
     /// If None, then it comes from the default registry (crates.io).
     registry: Option<&'a str>,
+
+    /// The file system path for a local path dependency.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<PathBuf>,
 }
 
 impl ser::Serialize for Dependency {
@@ -80,6 +85,7 @@ impl ser::Serialize for Dependency {
             target: self.platform(),
             rename: self.explicit_name_in_toml().map(|s| s.as_str()),
             registry: registry_id.as_ref().map(|sid| sid.url().as_str()),
+            path: self.source_id().local_path(),
         }
         .serialize(s)
     }
@@ -386,15 +392,22 @@ impl Dependency {
             self.source_id(),
             id
         );
-        self.set_version_req(VersionReq::exact(id.version()))
-            .set_source_id(id.source_id())
+        let me = Rc::make_mut(&mut self.inner);
+        me.req = VersionReq::exact(id.version());
+
+        // Only update the `precise` of this source to preserve other
+        // information about dependency's source which may not otherwise be
+        // tested during equality/hashing.
+        me.source_id = me
+            .source_id
+            .with_precise(id.source_id().precise().map(|s| s.to_string()));
+        self
     }
 
     /// Returns `true` if this is a "locked" dependency, basically whether it has
     /// an exact version req.
     pub fn is_locked(&self) -> bool {
-        // Kind of a hack to figure this out, but it works!
-        self.inner.req.to_string().starts_with('=')
+        self.inner.req.is_exact()
     }
 
     /// Returns `false` if the dependency is only used to build the local package.
@@ -406,10 +419,7 @@ impl Dependency {
     }
 
     pub fn is_build(&self) -> bool {
-        match self.inner.kind {
-            DepKind::Build => true,
-            _ => false,
-        }
+        matches!(self.inner.kind, DepKind::Build)
     }
 
     pub fn is_optional(&self) -> bool {

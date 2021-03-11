@@ -30,22 +30,9 @@ pub fn cli() -> App {
         .arg_target_dir()
         .arg_manifest_path()
         .arg_message_format()
-        .after_help(
-            "\
-By default the documentation for the local package and all dependencies is
-built. The output is all placed in `target/doc` in rustdoc's usual format.
-
-All packages in the workspace are documented if the `--workspace` flag is
-supplied. The `--workspace` flag is automatically assumed for a virtual
-manifest. Note that `--exclude` has to be specified in conjunction with the
-`--workspace` flag.
-
-If the `--package` argument is given, then SPEC is a package ID specification
-which indicates which package should be documented. If it is not given, then the
-current package is documented. For more information on SPEC and its format, see
-the `cargo help pkgid` command.
-",
-        )
+        .arg_ignore_rust_version()
+        .arg_unit_graph()
+        .after_help("Run `cargo help doc` for more detailed information.\n")
 }
 
 pub fn exec(config: &mut Config, args: &ArgMatches<'_>) -> CliResult {

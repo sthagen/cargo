@@ -9,8 +9,8 @@ use std::sync::Mutex;
 use serde::de;
 use serde::ser;
 
-use crate::core::interning::InternedString;
 use crate::core::source::SourceId;
+use crate::util::interning::InternedString;
 use crate::util::{CargoResult, ToSemver};
 
 lazy_static::lazy_static! {
@@ -58,7 +58,7 @@ impl ser::Serialize for PackageId {
             "{} {} ({})",
             self.inner.name,
             self.inner.version,
-            self.inner.source_id.into_url()
+            self.inner.source_id.as_url()
         ))
     }
 }

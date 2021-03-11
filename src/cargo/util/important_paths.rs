@@ -1,14 +1,13 @@
 use crate::util::errors::CargoResult;
 use crate::util::paths;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Finds the root `Cargo.toml`.
 pub fn find_root_manifest_for_wd(cwd: &Path) -> CargoResult<PathBuf> {
     let file = "Cargo.toml";
-    for current in paths::ancestors(cwd) {
+    for current in paths::ancestors(cwd, None) {
         let manifest = current.join(file);
-        if fs::metadata(&manifest).is_ok() {
+        if manifest.exists() {
             return Ok(manifest);
         }
     }

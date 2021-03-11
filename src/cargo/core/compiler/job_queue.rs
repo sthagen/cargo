@@ -53,15 +53,15 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::marker;
-use std::mem;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::format_err;
-use crossbeam_channel::{unbounded, Receiver, Sender};
 use crossbeam_utils::thread::Scope;
 use jobserver::{Acquired, Client, HelperThread};
 use log::{debug, info, trace};
+use rand::distributions::Alphanumeric;
+use rand::{thread_rng, Rng};
 
 use super::context::OutputFile;
 use super::job::{
@@ -70,21 +70,25 @@ use super::job::{
 };
 use super::timings::Timings;
 use super::{BuildContext, BuildPlan, CompileMode, Context, Unit};
-use crate::core::{PackageId, TargetKind};
-use crate::util;
+use crate::core::compiler::future_incompat::{
+    FutureBreakageItem, OnDiskReport, FUTURE_INCOMPAT_FILE,
+};
+use crate::core::{PackageId, Shell, TargetKind};
+use crate::drop_eprint;
 use crate::util::diagnostic_server::{self, DiagnosticPrinter};
-use crate::util::{internal, profile, CargoResult, CargoResultExt, ProcessBuilder};
-use crate::util::{Config, DependencyQueue};
-use crate::util::{Progress, ProgressStyle};
+use crate::util::machine_message::{self, Message as _};
+use crate::util::{self, internal, profile};
+use crate::util::{CargoResult, CargoResultExt, ProcessBuilder};
+use crate::util::{Config, DependencyQueue, Progress, ProgressStyle, Queue};
 
 /// This structure is backed by the `DependencyQueue` type and manages the
 /// queueing of compilation steps for each package. Packages enqueue units of
 /// work and then later on the entire graph is converted to DrainState and
 /// executed.
-pub struct JobQueue<'a, 'cfg> {
-    queue: DependencyQueue<Unit<'a>, Artifact, Job>,
+pub struct JobQueue<'cfg> {
+    queue: DependencyQueue<Unit, Artifact, Job>,
     counts: HashMap<PackageId, usize>,
-    timings: Timings<'a, 'cfg>,
+    timings: Timings<'cfg>,
 }
 
 /// This structure is backed by the `DependencyQueue` type and manages the
@@ -93,20 +97,41 @@ pub struct JobQueue<'a, 'cfg> {
 ///
 /// It is created from JobQueue when we have fully assembled the crate graph
 /// (i.e., all package dependencies are known).
-struct DrainState<'a, 'cfg> {
+///
+/// # Message queue
+///
+/// Each thread running a process uses the message queue to send messages back
+/// to the main thread. The main thread coordinates everything, and handles
+/// printing output.
+///
+/// It is important to be careful which messages use `push` vs `push_bounded`.
+/// `push` is for priority messages (like tokens, or "finished") where the
+/// sender shouldn't block. We want to handle those so real work can proceed
+/// ASAP.
+///
+/// `push_bounded` is only for messages being printed to stdout/stderr. Being
+/// bounded prevents a flood of messages causing a large amount of memory
+/// being used.
+///
+/// `push` also avoids blocking which helps avoid deadlocks. For example, when
+/// the diagnostic server thread is dropped, it waits for the thread to exit.
+/// But if the thread is blocked on a full queue, and there is a critical
+/// error, the drop will deadlock. This should be fixed at some point in the
+/// future. The jobserver thread has a similar problem, though it will time
+/// out after 1 second.
+struct DrainState<'cfg> {
     // This is the length of the DependencyQueue when starting out
     total_units: usize,
 
-    queue: DependencyQueue<Unit<'a>, Artifact, Job>,
-    tx: Sender<Message>,
-    rx: Receiver<Message>,
-    active: HashMap<JobId, Unit<'a>>,
+    queue: DependencyQueue<Unit, Artifact, Job>,
+    messages: Arc<Queue<Message>>,
+    active: HashMap<JobId, Unit>,
     compiled: HashSet<PackageId>,
     documented: HashSet<PackageId>,
     counts: HashMap<PackageId, usize>,
     progress: Progress<'cfg>,
     next_id: u32,
-    timings: Timings<'a, 'cfg>,
+    timings: Timings<'cfg>,
 
     /// Tokens that are currently owned by this Cargo, and may be "associated"
     /// with a rustc process. They may also be unused, though if so will be
@@ -127,11 +152,12 @@ struct DrainState<'a, 'cfg> {
     /// The list of jobs that we have not yet started executing, but have
     /// retrieved from the `queue`. We eagerly pull jobs off the main queue to
     /// allow us to request jobserver tokens pretty early.
-    pending_queue: Vec<(Unit<'a>, Job)>,
+    pending_queue: Vec<(Unit, Job)>,
     print: DiagnosticPrinter<'cfg>,
 
-    // How many jobs we've finished
+    /// How many jobs we've finished
     finished: usize,
+    per_crate_future_incompat_reports: Vec<FutureIncompatReportCrate>,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -143,9 +169,34 @@ impl std::fmt::Display for JobId {
     }
 }
 
+struct FutureIncompatReportCrate {
+    package_id: PackageId,
+    report: Vec<FutureBreakageItem>,
+}
+
+/// A `JobState` is constructed by `JobQueue::run` and passed to `Job::run`. It includes everything
+/// necessary to communicate between the main thread and the execution of the job.
+///
+/// The job may execute on either a dedicated thread or the main thread. If the job executes on the
+/// main thread, the `output` field must be set to prevent a deadlock.
 pub struct JobState<'a> {
     /// Channel back to the main thread to coordinate messages and such.
-    tx: Sender<Message>,
+    ///
+    /// When the `output` field is `Some`, care must be taken to avoid calling `push_bounded` on
+    /// the message queue to prevent a deadlock.
+    messages: Arc<Queue<Message>>,
+
+    /// Normally output is sent to the job queue with backpressure. When the job is fresh
+    /// however we need to immediately display the output to prevent a deadlock as the
+    /// output messages are processed on the same thread as they are sent from. `output`
+    /// defines where to output in this case.
+    ///
+    /// Currently the `Shell` inside `Config` is wrapped in a `RefCell` and thus can't be passed
+    /// between threads. This means that it isn't possible for multiple output messages to be
+    /// interleaved. In the future, it may be wrapped in a `Mutex` instead. In this case
+    /// interleaving is still prevented as the lock would be held for the whole printing of an
+    /// output message.
+    output: Option<&'a Config>,
 
     /// The job id that this state is associated with, used when sending
     /// messages back to the main thread.
@@ -189,6 +240,7 @@ enum Message {
     FixDiagnostic(diagnostic_server::Message),
     Token(io::Result<Acquired>),
     Finish(JobId, Artifact, CargoResult<()>),
+    FutureIncompatReport(JobId, Vec<FutureBreakageItem>),
 
     // This client should get release_raw called on it with one of our tokens
     NeedsToken(JobId),
@@ -199,7 +251,7 @@ enum Message {
 
 impl<'a> JobState<'a> {
     pub fn running(&self, cmd: &ProcessBuilder) {
-        let _ = self.tx.send(Message::Run(self.id, cmd.to_string()));
+        self.messages.push(Message::Run(self.id, cmd.to_string()));
     }
 
     pub fn build_plan(
@@ -208,17 +260,28 @@ impl<'a> JobState<'a> {
         cmd: ProcessBuilder,
         filenames: Arc<Vec<OutputFile>>,
     ) {
-        let _ = self
-            .tx
-            .send(Message::BuildPlanMsg(module_name, cmd, filenames));
+        self.messages
+            .push(Message::BuildPlanMsg(module_name, cmd, filenames));
     }
 
-    pub fn stdout(&self, stdout: String) {
-        drop(self.tx.send(Message::Stdout(stdout)));
+    pub fn stdout(&self, stdout: String) -> CargoResult<()> {
+        if let Some(config) = self.output {
+            writeln!(config.shell().out(), "{}", stdout)?;
+        } else {
+            self.messages.push_bounded(Message::Stdout(stdout));
+        }
+        Ok(())
     }
 
-    pub fn stderr(&self, stderr: String) {
-        drop(self.tx.send(Message::Stderr(stderr)));
+    pub fn stderr(&self, stderr: String) -> CargoResult<()> {
+        if let Some(config) = self.output {
+            let mut shell = config.shell();
+            shell.print_ansi(stderr.as_bytes())?;
+            shell.err().write_all(b"\n")?;
+        } else {
+            self.messages.push_bounded(Message::Stderr(stderr));
+        }
+        Ok(())
     }
 
     /// A method used to signal to the coordinator thread that the rmeta file
@@ -228,9 +291,13 @@ impl<'a> JobState<'a> {
     /// produced once!
     pub fn rmeta_produced(&self) {
         self.rmeta_required.set(false);
-        let _ = self
-            .tx
-            .send(Message::Finish(self.id, Artifact::Metadata, Ok(())));
+        self.messages
+            .push(Message::Finish(self.id, Artifact::Metadata, Ok(())));
+    }
+
+    pub fn future_incompat_report(&self, report: Vec<FutureBreakageItem>) {
+        self.messages
+            .push(Message::FutureIncompatReport(self.id, report));
     }
 
     /// The rustc underlying this Job is about to acquire a jobserver token (i.e., block)
@@ -239,32 +306,27 @@ impl<'a> JobState<'a> {
     /// This should arrange for the associated client to eventually get a token via
     /// `client.release_raw()`.
     pub fn will_acquire(&self) {
-        let _ = self.tx.send(Message::NeedsToken(self.id));
+        self.messages.push(Message::NeedsToken(self.id));
     }
 
     /// The rustc underlying this Job is informing us that it is done with a jobserver token.
     ///
     /// Note that it does *not* write that token back anywhere.
     pub fn release_token(&self) {
-        let _ = self.tx.send(Message::ReleaseToken(self.id));
+        self.messages.push(Message::ReleaseToken(self.id));
     }
 }
 
-impl<'a, 'cfg> JobQueue<'a, 'cfg> {
-    pub fn new(bcx: &BuildContext<'a, 'cfg>, root_units: &[Unit<'a>]) -> JobQueue<'a, 'cfg> {
+impl<'cfg> JobQueue<'cfg> {
+    pub fn new(bcx: &BuildContext<'_, 'cfg>) -> JobQueue<'cfg> {
         JobQueue {
             queue: DependencyQueue::new(),
             counts: HashMap::new(),
-            timings: Timings::new(bcx, root_units),
+            timings: Timings::new(bcx, &bcx.roots),
         }
     }
 
-    pub fn enqueue(
-        &mut self,
-        cx: &Context<'a, 'cfg>,
-        unit: &Unit<'a>,
-        job: Job,
-    ) -> CargoResult<()> {
+    pub fn enqueue(&mut self, cx: &Context<'_, 'cfg>, unit: &Unit, job: Job) -> CargoResult<()> {
         let dependencies = cx.unit_deps(unit);
         let mut queue_deps = dependencies
             .iter()
@@ -283,7 +345,7 @@ impl<'a, 'cfg> JobQueue<'a, 'cfg> {
                 } else {
                     Artifact::All
                 };
-                (dep.unit, artifact)
+                (dep.unit.clone(), artifact)
             })
             .collect::<HashMap<_, _>>();
 
@@ -310,23 +372,27 @@ impl<'a, 'cfg> JobQueue<'a, 'cfg> {
         // transitively contains the `Metadata` edge.
         if unit.requires_upstream_objects() {
             for dep in dependencies {
-                depend_on_deps_of_deps(cx, &mut queue_deps, dep.unit);
+                depend_on_deps_of_deps(cx, &mut queue_deps, dep.unit.clone());
             }
 
-            fn depend_on_deps_of_deps<'a>(
-                cx: &Context<'a, '_>,
-                deps: &mut HashMap<Unit<'a>, Artifact>,
-                unit: Unit<'a>,
+            fn depend_on_deps_of_deps(
+                cx: &Context<'_, '_>,
+                deps: &mut HashMap<Unit, Artifact>,
+                unit: Unit,
             ) {
                 for dep in cx.unit_deps(&unit) {
-                    if deps.insert(dep.unit, Artifact::All).is_none() {
-                        depend_on_deps_of_deps(cx, deps, dep.unit);
+                    if deps.insert(dep.unit.clone(), Artifact::All).is_none() {
+                        depend_on_deps_of_deps(cx, deps, dep.unit.clone());
                     }
                 }
             }
         }
 
-        self.queue.queue(*unit, job, queue_deps);
+        // For now we use a fixed placeholder value for the cost of each unit, but
+        // in the future this could be used to allow users to provide hints about
+        // relative expected costs of units, or this could be automatically set in
+        // a smarter way using timing data from a previous compilation.
+        self.queue.queue(unit.clone(), job, queue_deps, 100);
         *self.counts.entry(unit.pkg.package_id()).or_insert(0) += 1;
         Ok(())
     }
@@ -336,17 +402,19 @@ impl<'a, 'cfg> JobQueue<'a, 'cfg> {
     /// This function will spawn off `config.jobs()` workers to build all of the
     /// necessary dependencies, in order. Freshness is propagated as far as
     /// possible along each dependency chain.
-    pub fn execute(mut self, cx: &mut Context<'a, '_>, plan: &mut BuildPlan) -> CargoResult<()> {
+    pub fn execute(mut self, cx: &mut Context<'_, '_>, plan: &mut BuildPlan) -> CargoResult<()> {
         let _p = profile::start("executing the job graph");
         self.queue.queue_finished();
 
-        let (tx, rx) = unbounded();
         let progress = Progress::with_style("Building", ProgressStyle::Ratio, cx.bcx.config);
         let state = DrainState {
             total_units: self.queue.len(),
             queue: self.queue,
-            tx,
-            rx,
+            // 100 here is somewhat arbitrary. It is a few screenfulls of
+            // output, and hopefully at most a few megabytes of memory for
+            // typical messages. If you change this, please update the test
+            // caching_large_output, too.
+            messages: Arc::new(Queue::new(100)),
             active: HashMap::new(),
             compiled: HashSet::new(),
             documented: HashSet::new(),
@@ -354,48 +422,55 @@ impl<'a, 'cfg> JobQueue<'a, 'cfg> {
             progress,
             next_id: 0,
             timings: self.timings,
-
             tokens: Vec::new(),
             rustc_tokens: HashMap::new(),
             to_send_clients: BTreeMap::new(),
             pending_queue: Vec::new(),
             print: DiagnosticPrinter::new(cx.bcx.config),
             finished: 0,
+            per_crate_future_incompat_reports: Vec::new(),
         };
 
         // Create a helper thread for acquiring jobserver tokens
-        let tx = state.tx.clone();
+        let messages = state.messages.clone();
         let helper = cx
             .jobserver
             .clone()
             .into_helper_thread(move |token| {
-                drop(tx.send(Message::Token(token)));
+                messages.push(Message::Token(token));
             })
             .chain_err(|| "failed to create helper thread for jobserver management")?;
 
         // Create a helper thread to manage the diagnostics for rustfix if
         // necessary.
-        let tx = state.tx.clone();
+        let messages = state.messages.clone();
+        // It is important that this uses `push` instead of `push_bounded` for
+        // now. If someone wants to fix this to be bounded, the `drop`
+        // implementation needs to be changed to avoid possible deadlocks.
         let _diagnostic_server = cx
             .bcx
             .build_config
             .rustfix_diagnostic_server
             .borrow_mut()
             .take()
-            .map(move |srv| srv.start(move |msg| drop(tx.send(Message::FixDiagnostic(msg)))));
+            .map(move |srv| srv.start(move |msg| messages.push(Message::FixDiagnostic(msg))));
 
-        crossbeam_utils::thread::scope(move |scope| state.drain_the_queue(cx, plan, scope, &helper))
-            .expect("child threads shouldn't panic")
+        crossbeam_utils::thread::scope(move |scope| {
+            match state.drain_the_queue(cx, plan, scope, &helper) {
+                Some(err) => Err(err),
+                None => Ok(()),
+            }
+        })
+        .expect("child threads shouldn't panic")
     }
 }
 
-impl<'a, 'cfg> DrainState<'a, 'cfg> {
+impl<'cfg> DrainState<'cfg> {
     fn spawn_work_if_possible(
         &mut self,
-        cx: &mut Context<'a, '_>,
+        cx: &mut Context<'_, '_>,
         jobserver_helper: &HelperThread,
         scope: &Scope<'_>,
-        has_errored: bool,
     ) -> CargoResult<()> {
         // Dequeue as much work as we can, learning about everything
         // possible that can run. Note that this is also the point where we
@@ -408,17 +483,20 @@ impl<'a, 'cfg> DrainState<'a, 'cfg> {
             }
         }
 
-        // Do not actually spawn the new work if we've errored out
-        if has_errored {
-            return Ok(());
-        }
-
         // Now that we've learned of all possible work that we can execute
         // try to spawn it so long as we've got a jobserver token which says
         // we're able to perform some parallel work.
         while self.has_extra_tokens() && !self.pending_queue.is_empty() {
             let (unit, job) = self.pending_queue.remove(0);
-            self.run(&unit, job, cx, scope)?;
+            *self.counts.get_mut(&unit.pkg.package_id()).unwrap() -= 1;
+            if !cx.bcx.build_config.build_plan {
+                // Print out some nice progress information.
+                // NOTE: An error here will drop the job without starting it.
+                // That should be OK, since we want to exit as soon as
+                // possible during an error.
+                self.note_working_on(cx.bcx.config, &unit, job.freshness())?;
+            }
+            self.run(&unit, job, cx, scope);
         }
 
         Ok(())
@@ -466,24 +544,24 @@ impl<'a, 'cfg> DrainState<'a, 'cfg> {
 
     fn handle_event(
         &mut self,
-        cx: &mut Context<'a, '_>,
+        cx: &mut Context<'_, '_>,
         jobserver_helper: &HelperThread,
         plan: &mut BuildPlan,
         event: Message,
-    ) -> CargoResult<Option<anyhow::Error>> {
+    ) -> CargoResult<()> {
         match event {
             Message::Run(id, cmd) => {
                 cx.bcx
                     .config
                     .shell()
                     .verbose(|c| c.status("Running", &cmd))?;
-                self.timings.unit_start(id, self.active[&id]);
+                self.timings.unit_start(id, self.active[&id].clone());
             }
             Message::BuildPlanMsg(module_name, cmd, filenames) => {
                 plan.update(&module_name, &cmd, &filenames)?;
             }
             Message::Stdout(out) => {
-                cx.bcx.config.shell().stdout_println(out);
+                writeln!(cx.bcx.config.shell().out(), "{}", out)?;
             }
             Message::Stderr(err) => {
                 let mut shell = cx.bcx.config.shell();
@@ -519,7 +597,7 @@ impl<'a, 'cfg> DrainState<'a, 'cfg> {
                     // in there as we'll get another `Finish` later on.
                     Artifact::Metadata => {
                         info!("end (meta): {:?}", id);
-                        self.active[&id]
+                        self.active[&id].clone()
                     }
                 };
                 info!("end ({:?}): {:?}", unit, result);
@@ -528,19 +606,14 @@ impl<'a, 'cfg> DrainState<'a, 'cfg> {
                     Err(e) => {
                         let msg = "The following warnings were emitted during compilation:";
                         self.emit_warnings(Some(msg), &unit, cx)?;
-
-                        if !self.active.is_empty() {
-                            crate::display_error(&e, &mut *cx.bcx.config.shell());
-                            cx.bcx.config.shell().warn(
-                                "build failed, waiting for other \
-                                 jobs to finish...",
-                            )?;
-                            return Ok(Some(anyhow::format_err!("build failed")));
-                        } else {
-                            return Ok(Some(e));
-                        }
+                        return Err(e);
                     }
                 }
+            }
+            Message::FutureIncompatReport(id, report) => {
+                let package_id = self.active[&id].pkg.package_id();
+                self.per_crate_future_incompat_reports
+                    .push(FutureIncompatReportCrate { package_id, report });
             }
             Message::Token(acquired_token) => {
                 let token = acquired_token.chain_err(|| "failed to acquire jobserver token")?;
@@ -573,7 +646,7 @@ impl<'a, 'cfg> DrainState<'a, 'cfg> {
             }
         }
 
-        Ok(None)
+        Ok(())
     }
 
     // This will also tick the progress bar as appropriate
@@ -584,7 +657,7 @@ impl<'a, 'cfg> DrainState<'a, 'cfg> {
         // to run above to calculate CPU usage over time. To do this we
         // listen for a message with a timeout, and on timeout we run the
         // previous parts of the loop again.
-        let events: Vec<_> = self.rx.try_iter().collect();
+        let mut events = self.messages.try_pop_all();
         info!(
             "tokens in use: {}, rustc_tokens: {:?}, waiting_rustcs: {:?} (events this tick: {})",
             self.tokens.len(),
@@ -602,23 +675,30 @@ impl<'a, 'cfg> DrainState<'a, 'cfg> {
             loop {
                 self.tick_progress();
                 self.tokens.truncate(self.active.len() - 1);
-                match self.rx.recv_timeout(Duration::from_millis(500)) {
-                    Ok(message) => break vec![message],
-                    Err(_) => continue,
+                match self.messages.pop(Duration::from_millis(500)) {
+                    Some(message) => {
+                        events.push(message);
+                        break;
+                    }
+                    None => continue,
                 }
             }
-        } else {
-            events
         }
+        events
     }
 
+    /// This is the "main" loop, where Cargo does all work to run the
+    /// compiler.
+    ///
+    /// This returns an Option to prevent the use of `?` on `Result` types
+    /// because it is important for the loop to carefully handle errors.
     fn drain_the_queue(
         mut self,
-        cx: &mut Context<'a, '_>,
+        cx: &mut Context<'_, '_>,
         plan: &mut BuildPlan,
-        scope: &Scope<'a>,
+        scope: &Scope<'_>,
         jobserver_helper: &HelperThread,
-    ) -> CargoResult<()> {
+    ) -> Option<anyhow::Error> {
         trace!("queue: {:#?}", self.queue);
 
         // Iteratively execute the entire dependency graph. Each turn of the
@@ -632,8 +712,15 @@ impl<'a, 'cfg> DrainState<'a, 'cfg> {
         // successful and otherwise wait for pending work to finish if it failed
         // and then immediately return.
         let mut error = None;
+        // CAUTION! Do not use `?` or break out of the loop early. Every error
+        // must be handled in such a way that the loop is still allowed to
+        // drain event messages.
         loop {
-            self.spawn_work_if_possible(cx, jobserver_helper, scope, error.is_some())?;
+            if error.is_none() {
+                if let Err(e) = self.spawn_work_if_possible(cx, jobserver_helper, scope) {
+                    self.handle_error(&mut cx.bcx.config.shell(), &mut error, e);
+                }
+            }
 
             // If after all that we're not actually running anything then we're
             // done!
@@ -641,7 +728,9 @@ impl<'a, 'cfg> DrainState<'a, 'cfg> {
                 break;
             }
 
-            self.grant_rustc_token_requests()?;
+            if let Err(e) = self.grant_rustc_token_requests() {
+                self.handle_error(&mut cx.bcx.config.shell(), &mut error, e);
+            }
 
             // And finally, before we block waiting for the next event, drop any
             // excess tokens we may have accidentally acquired. Due to how our
@@ -649,8 +738,8 @@ impl<'a, 'cfg> DrainState<'a, 'cfg> {
             // don't actually use, and if this happens just relinquish it back
             // to the jobserver itself.
             for event in self.wait_for_events() {
-                if let Some(err) = self.handle_event(cx, jobserver_helper, plan, event)? {
-                    error = Some(err);
+                if let Err(event_err) = self.handle_event(cx, jobserver_helper, plan, event) {
+                    self.handle_error(&mut cx.bcx.config.shell(), &mut error, event_err);
                 }
             }
         }
@@ -675,22 +764,146 @@ impl<'a, 'cfg> DrainState<'a, 'cfg> {
         }
 
         let time_elapsed = util::elapsed(cx.bcx.config.creation_time().elapsed());
-        self.timings.finished(cx.bcx, &error)?;
+        if let Err(e) = self.timings.finished(cx.bcx, &error) {
+            if error.is_some() {
+                crate::display_error(&e, &mut cx.bcx.config.shell());
+            } else {
+                return Some(e);
+            }
+        }
+        if cx.bcx.build_config.emit_json() {
+            let mut shell = cx.bcx.config.shell();
+            let msg = machine_message::BuildFinished {
+                success: error.is_none(),
+            }
+            .to_json_string();
+            if let Err(e) = writeln!(shell.out(), "{}", msg) {
+                if error.is_some() {
+                    crate::display_error(&e.into(), &mut shell);
+                } else {
+                    return Some(e.into());
+                }
+            }
+        }
 
         if let Some(e) = error {
-            Err(e)
+            Some(e)
         } else if self.queue.is_empty() && self.pending_queue.is_empty() {
             let message = format!(
                 "{} [{}] target(s) in {}",
                 profile_name, opt_type, time_elapsed
             );
             if !cx.bcx.build_config.build_plan {
-                cx.bcx.config.shell().status("Finished", message)?;
+                // It doesn't really matter if this fails.
+                drop(cx.bcx.config.shell().status("Finished", message));
+                self.emit_future_incompat(cx);
             }
-            Ok(())
+
+            None
         } else {
             debug!("queue: {:#?}", self.queue);
-            Err(internal("finished with jobs still left in the queue"))
+            Some(internal("finished with jobs still left in the queue"))
+        }
+    }
+
+    fn emit_future_incompat(&mut self, cx: &mut Context<'_, '_>) {
+        if cx.bcx.config.cli_unstable().enable_future_incompat_feature
+            && !self.per_crate_future_incompat_reports.is_empty()
+        {
+            self.per_crate_future_incompat_reports
+                .sort_by_key(|r| r.package_id);
+
+            let crates_and_versions = self
+                .per_crate_future_incompat_reports
+                .iter()
+                .map(|r| r.package_id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            drop(cx.bcx.config.shell().warn(&format!(
+                "the following crates contain code that will be rejected by a future version of Rust: {}",
+                crates_and_versions
+            )));
+
+            let mut full_report = String::new();
+            let mut rng = thread_rng();
+
+            // Generate a short ID to allow detecting if a report gets overwritten
+            let id: String = std::iter::repeat(())
+                .map(|()| char::from(rng.sample(Alphanumeric)))
+                .take(4)
+                .collect();
+
+            for report in std::mem::take(&mut self.per_crate_future_incompat_reports) {
+                full_report.push_str(&format!(
+                    "The crate `{}` currently triggers the following future incompatibility lints:\n",
+                    report.package_id
+                ));
+                for item in report.report {
+                    let rendered = if cx.bcx.config.shell().err_supports_color() {
+                        item.diagnostic.rendered
+                    } else {
+                        strip_ansi_escapes::strip(&item.diagnostic.rendered)
+                            .map(|v| String::from_utf8(v).expect("utf8"))
+                            .expect("strip should never fail")
+                    };
+
+                    for line in rendered.lines() {
+                        full_report.push_str(&format!("> {}\n", line));
+                    }
+                }
+            }
+
+            let report_file = cx.bcx.ws.target_dir().open_rw(
+                FUTURE_INCOMPAT_FILE,
+                cx.bcx.config,
+                "Future incompatibility report",
+            );
+            let err = report_file
+                .and_then(|report_file| {
+                    let on_disk_report = OnDiskReport {
+                        id: id.clone(),
+                        report: full_report.clone(),
+                    };
+                    serde_json::to_writer(report_file, &on_disk_report).map_err(|e| e.into())
+                })
+                .err();
+            if let Some(e) = err {
+                crate::display_warning_with_error(
+                    "failed to write on-disk future incompat report",
+                    &e,
+                    &mut cx.bcx.config.shell(),
+                );
+            }
+
+            if cx.bcx.build_config.future_incompat_report {
+                drop_eprint!(cx.bcx.config, "{}", full_report);
+                drop(cx.bcx.config.shell().note(
+                    &format!("this report can be shown with `cargo describe-future-incompatibilities -Z future-incompat-report --id {}`", id)
+                ));
+            } else {
+                drop(cx.bcx.config.shell().note(
+                    &format!("to see what the problems were, use the option `--future-incompat-report`, or run `cargo describe-future-incompatibilities --id {}`", id)
+                ));
+            }
+        }
+    }
+
+    fn handle_error(
+        &self,
+        shell: &mut Shell,
+        err_state: &mut Option<anyhow::Error>,
+        new_err: anyhow::Error,
+    ) {
+        if err_state.is_some() {
+            // Already encountered one error.
+            log::warn!("{:?}", new_err);
+        } else if !self.active.is_empty() {
+            crate::display_error(&new_err, shell);
+            drop(shell.warn("build failed, waiting for other jobs to finish..."));
+            *err_state = Some(anyhow::format_err!("build failed"));
+        } else {
+            *err_state = Some(new_err);
         }
     }
 
@@ -721,7 +934,7 @@ impl<'a, 'cfg> DrainState<'a, 'cfg> {
         ));
     }
 
-    fn name_for_progress(&self, unit: &Unit<'_>) -> String {
+    fn name_for_progress(&self, unit: &Unit) -> String {
         let pkg_name = unit.pkg.name();
         match unit.mode {
             CompileMode::Doc { .. } => format!("{}(doc)", pkg_name),
@@ -740,45 +953,29 @@ impl<'a, 'cfg> DrainState<'a, 'cfg> {
         }
     }
 
-    /// Executes a job, pushing the spawned thread's handled onto `threads`.
-    fn run(
-        &mut self,
-        unit: &Unit<'a>,
-        job: Job,
-        cx: &Context<'a, '_>,
-        scope: &Scope<'_>,
-    ) -> CargoResult<()> {
+    /// Executes a job.
+    ///
+    /// Fresh jobs block until finished (which should be very fast!), Dirty
+    /// jobs will spawn a thread in the background and return immediately.
+    fn run(&mut self, unit: &Unit, job: Job, cx: &Context<'_, '_>, scope: &Scope<'_>) {
         let id = JobId(self.next_id);
         self.next_id = self.next_id.checked_add(1).unwrap();
 
         info!("start {}: {:?}", id, unit);
 
-        assert!(self.active.insert(id, *unit).is_none());
-        *self.counts.get_mut(&unit.pkg.package_id()).unwrap() -= 1;
+        assert!(self.active.insert(id, unit.clone()).is_none());
 
-        let my_tx = self.tx.clone();
+        let messages = self.messages.clone();
         let fresh = job.freshness();
         let rmeta_required = cx.rmeta_required(unit);
 
-        if !cx.bcx.build_config.build_plan {
-            // Print out some nice progress information.
-            self.note_working_on(cx.bcx.config, unit, fresh)?;
-        }
-
-        let doit = move || {
-            let state = JobState {
-                id,
-                tx: my_tx.clone(),
-                rmeta_required: Cell::new(rmeta_required),
-                _marker: marker::PhantomData,
-            };
-
+        let doit = move |state: JobState<'_>| {
             let mut sender = FinishOnDrop {
-                tx: &my_tx,
+                messages: &state.messages,
                 id,
-                result: Err(format_err!("worker panicked")),
+                result: None,
             };
-            sender.result = job.run(&state);
+            sender.result = Some(job.run(&state));
 
             // If the `rmeta_required` wasn't consumed but it was set
             // previously, then we either have:
@@ -792,10 +989,10 @@ impl<'a, 'cfg> DrainState<'a, 'cfg> {
             // we'll just naturally abort the compilation operation but for 1
             // we need to make sure that the metadata is flagged as produced so
             // send a synthetic message here.
-            if state.rmeta_required.get() && sender.result.is_ok() {
-                my_tx
-                    .send(Message::Finish(id, Artifact::Metadata, Ok(())))
-                    .unwrap();
+            if state.rmeta_required.get() && sender.result.as_ref().unwrap().is_ok() {
+                state
+                    .messages
+                    .push(Message::Finish(state.id, Artifact::Metadata, Ok(())));
             }
 
             // Use a helper struct with a `Drop` implementation to guarantee
@@ -803,15 +1000,19 @@ impl<'a, 'cfg> DrainState<'a, 'cfg> {
             // shouldn't panic unless there's a bug in Cargo, so we just need
             // to make sure nothing hangs by accident.
             struct FinishOnDrop<'a> {
-                tx: &'a Sender<Message>,
+                messages: &'a Queue<Message>,
                 id: JobId,
-                result: CargoResult<()>,
+                result: Option<CargoResult<()>>,
             }
 
             impl Drop for FinishOnDrop<'_> {
                 fn drop(&mut self) {
-                    let msg = mem::replace(&mut self.result, Ok(()));
-                    drop(self.tx.send(Message::Finish(self.id, Artifact::All, msg)));
+                    let result = self
+                        .result
+                        .take()
+                        .unwrap_or_else(|| Err(format_err!("worker panicked")));
+                    self.messages
+                        .push(Message::Finish(self.id, Artifact::All, result));
                 }
             }
         };
@@ -819,30 +1020,44 @@ impl<'a, 'cfg> DrainState<'a, 'cfg> {
         match fresh {
             Freshness::Fresh => {
                 self.timings.add_fresh();
-                doit();
+                // Running a fresh job on the same thread is often much faster than spawning a new
+                // thread to run the job.
+                doit(JobState {
+                    id,
+                    messages,
+                    output: Some(cx.bcx.config),
+                    rmeta_required: Cell::new(rmeta_required),
+                    _marker: marker::PhantomData,
+                });
             }
             Freshness::Dirty => {
                 self.timings.add_dirty();
-                scope.spawn(move |_| doit());
+                scope.spawn(move |_| {
+                    doit(JobState {
+                        id,
+                        messages: messages.clone(),
+                        output: None,
+                        rmeta_required: Cell::new(rmeta_required),
+                        _marker: marker::PhantomData,
+                    })
+                });
             }
         }
-
-        Ok(())
     }
 
     fn emit_warnings(
         &mut self,
         msg: Option<&str>,
-        unit: &Unit<'a>,
-        cx: &mut Context<'a, '_>,
+        unit: &Unit,
+        cx: &mut Context<'_, '_>,
     ) -> CargoResult<()> {
         let outputs = cx.build_script_outputs.lock().unwrap();
-        let metadata = match cx.find_build_script_metadata(*unit) {
+        let metadata = match cx.find_build_script_metadata(unit) {
             Some(metadata) => metadata,
             None => return Ok(()),
         };
         let bcx = &mut cx.bcx;
-        if let Some(output) = outputs.get(unit.pkg.package_id(), metadata) {
+        if let Some(output) = outputs.get(metadata) {
             if !output.warnings.is_empty() {
                 if let Some(msg) = msg {
                     writeln!(bcx.config.shell().err(), "{}\n", msg)?;
@@ -865,11 +1080,11 @@ impl<'a, 'cfg> DrainState<'a, 'cfg> {
     fn finish(
         &mut self,
         id: JobId,
-        unit: &Unit<'a>,
+        unit: &Unit,
         artifact: Artifact,
-        cx: &mut Context<'a, '_>,
+        cx: &mut Context<'_, '_>,
     ) -> CargoResult<()> {
-        if unit.mode.is_run_custom_build() && cx.bcx.show_warnings(unit.pkg.package_id()) {
+        if unit.mode.is_run_custom_build() && unit.show_warnings(cx.bcx.config) {
             self.emit_warnings(None, unit, cx)?;
         }
         let unlocked = self.queue.finish(unit, &artifact);
@@ -892,7 +1107,7 @@ impl<'a, 'cfg> DrainState<'a, 'cfg> {
     fn note_working_on(
         &mut self,
         config: &Config,
-        unit: &Unit<'a>,
+        unit: &Unit,
         fresh: Freshness,
     ) -> CargoResult<()> {
         if (self.compiled.contains(&unit.pkg.package_id()) && !unit.mode.is_doc())
@@ -907,15 +1122,15 @@ impl<'a, 'cfg> DrainState<'a, 'cfg> {
             Dirty => {
                 if unit.mode.is_doc() {
                     self.documented.insert(unit.pkg.package_id());
-                    config.shell().status("Documenting", unit.pkg)?;
+                    config.shell().status("Documenting", &unit.pkg)?;
                 } else if unit.mode.is_doc_test() {
                     // Skip doc test.
                 } else {
                     self.compiled.insert(unit.pkg.package_id());
                     if unit.mode.is_check() {
-                        config.shell().status("Checking", unit.pkg)?;
+                        config.shell().status("Checking", &unit.pkg)?;
                     } else {
-                        config.shell().status("Compiling", unit.pkg)?;
+                        config.shell().status("Compiling", &unit.pkg)?;
                     }
                 }
             }
@@ -925,7 +1140,7 @@ impl<'a, 'cfg> DrainState<'a, 'cfg> {
                     && !(unit.mode.is_doc_test() && self.compiled.contains(&unit.pkg.package_id()))
                 {
                     self.compiled.insert(unit.pkg.package_id());
-                    config.shell().verbose(|c| c.status("Fresh", unit.pkg))?;
+                    config.shell().verbose(|c| c.status("Fresh", &unit.pkg))?;
                 }
             }
         }

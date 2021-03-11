@@ -12,14 +12,14 @@ all parent directories. If, for example, Cargo were invoked in
 `/projects/foo/bar/baz`, then the following configuration files would be
 probed for and unified in this order:
 
-* `/projects/foo/bar/baz/.cargo/config`
-* `/projects/foo/bar/.cargo/config`
-* `/projects/foo/.cargo/config`
-* `/projects/.cargo/config`
-* `/.cargo/config`
-* `$CARGO_HOME/config` which defaults to:
-    * Windows: `%USERPROFILE%\.cargo\config`
-    * Unix: `$HOME/.cargo/config`
+* `/projects/foo/bar/baz/.cargo/config.toml`
+* `/projects/foo/bar/.cargo/config.toml`
+* `/projects/foo/.cargo/config.toml`
+* `/projects/.cargo/config.toml`
+* `/.cargo/config.toml`
+* `$CARGO_HOME/config.toml` which defaults to:
+    * Windows: `%USERPROFILE%\.cargo\config.toml`
+    * Unix: `$HOME/.cargo/config.toml`
 
 With this structure, you can specify configuration per-package, and even
 possibly check it into version control. You can also specify personal defaults
@@ -29,6 +29,11 @@ If a key is specified in multiple config files, the values will get merged
 together. Numbers, strings, and booleans will use the value in the deeper
 config directory taking precedence over ancestor directories, where the
 home directory is the lowest priority. Arrays will be joined together.
+
+> **Note:** Cargo also reads config files without the `.toml` extension, such as
+> `.cargo/config`. Support for the `.toml` extension was added in version 1.39
+> and is the preferred form. If both files exist, Cargo will use the file
+> without the extension.
 
 ### Configuration format
 
@@ -49,17 +54,18 @@ rr = "run --release"
 space_example = ["run", "--release", "--", "\"command list\""]
 
 [build]
-jobs = 1                  # number of parallel jobs, defaults to # of CPUs
-rustc = "rustc"           # the rust compiler tool
-rustc-wrapper = "…"       # run this wrapper instead of `rustc`
-rustdoc = "rustdoc"       # the doc generator tool
-target = "triple"         # build for the target triple (ignored by `cargo install`)
-target-dir = "target"     # path of where to place all generated artifacts
-rustflags = ["…", "…"]    # custom flags to pass to all compiler invocations
-rustdocflags = ["…", "…"] # custom flags to pass to rustdoc
-incremental = true        # whether or not to enable incremental compilation
-dep-info-basedir = "…"    # path for the base directory for targets in depfiles
-pipelining = true         # rustc pipelining
+jobs = 1                      # number of parallel jobs, defaults to # of CPUs
+rustc = "rustc"               # the rust compiler tool
+rustc-wrapper = "…"           # run this wrapper instead of `rustc`
+rustc-workspace-wrapper = "…" # run this wrapper instead of `rustc` for workspace members
+rustdoc = "rustdoc"           # the doc generator tool
+target = "triple"             # build for the target triple (ignored by `cargo install`)
+target-dir = "target"         # path of where to place all generated artifacts
+rustflags = ["…", "…"]        # custom flags to pass to all compiler invocations
+rustdocflags = ["…", "…"]     # custom flags to pass to rustdoc
+incremental = true            # whether or not to enable incremental compilation
+dep-info-basedir = "…"        # path for the base directory for targets in depfiles
+pipelining = true             # rustc pipelining
 
 [cargo-new]
 name = "Your Name"        # name to use in `authors` field
@@ -142,6 +148,8 @@ metadata_key2 = "value"
 [term]
 verbose = false        # whether cargo provides verbose output
 color = 'auto'         # whether cargo colorizes output
+progress.when = 'auto' # whether cargo shows progress bar
+progress.width = 80    # width of progress bar
 ```
 
 ### Environment variables
@@ -179,15 +187,15 @@ relative to the current working directory.
 runner = "foo"  # Searches `PATH` for `foo`.
 
 [source.vendored-sources]
-# Directory is relative to the parent where `.cargo/config` is located.
-# For example, `/my/project/.cargo/config` would result in `/my/project/vendor`.
+# Directory is relative to the parent where `.cargo/config.toml` is located.
+# For example, `/my/project/.cargo/config.toml` would result in `/my/project/vendor`.
 directory = "vendor"
 ```
 
 ### Credentials
 
 Configuration values with sensitive information are stored in the
-`$CARGO_HOME/credentials` file. This file is automatically created and updated
+`$CARGO_HOME/credentials.toml` file. This file is automatically created and updated
 by [`cargo login`]. It follows the same format as Cargo config files.
 
 ```toml
@@ -274,6 +282,15 @@ Sets the executable to use for `rustc`.
 
 Sets a wrapper to execute instead of `rustc`. The first argument passed to the
 wrapper is the path to the actual `rustc`.
+
+##### `build.rustc-workspace-wrapper`
+* Type: string (program path)
+* Default: none
+* Environment: `CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER` or `RUSTC_WORKSPACE_WRAPPER`
+
+Sets a wrapper to execute instead of `rustc`, for workspace members only.
+The first argument passed to the wrapper is the path to the actual `rustc`.
+It affects the filename hash so that artifacts produced by the wrapper are cached separately.
 
 ##### `build.rustdoc`
 * Type: string (program path)
@@ -681,7 +698,7 @@ specified.
 
 ##### `registry.index`
 
-This value is deprecated and should not be used.
+This value is no longer accepted and should not be used.
 
 ##### `registry.default`
 * Type: string
@@ -898,6 +915,23 @@ Controls whether or not colored output is used in the terminal. Possible values:
 
 Can be overridden with the `--color` command-line option.
 
+##### `term.progress.when`
+* Type: string
+* Default: "auto"
+* Environment: `CARGO_TERM_PROGRESS_WHEN`
+
+Controls whether or not progress bar is shown in the terminal. Possible values:
+
+* `auto` (default): Intelligently guess whether to show progress bar.
+* `always`: Always show progress bar.
+* `never`: Never show progress bar.
+
+##### `term.progress.width`
+* Type: integer
+* Default: none
+* Environment: `CARGO_TERM_PROGRESS_WIDTH`
+
+Sets the width for progress bar.
 
 [`cargo bench`]: ../commands/cargo-bench.md
 [`cargo login`]: ../commands/cargo-login.md
@@ -913,7 +947,7 @@ Can be overridden with the `--color` command-line option.
 [build scripts]: build-scripts.md
 [`-C linker`]: ../../rustc/codegen-options/index.md#linker
 [override a build script]: build-scripts.md#overriding-build-scripts
-[toml]: https://github.com/toml-lang/toml
+[toml]: https://toml.io/
 [incremental compilation]: profiles.md#incremental
 [profile]: profiles.md
 [libcurl format]: https://ec.haxx.se/usingcurl-proxies.html

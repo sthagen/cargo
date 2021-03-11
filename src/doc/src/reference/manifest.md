@@ -1,7 +1,7 @@
 ## The Manifest Format
 
-The `Cargo.toml` file for each package is called its *manifest*. Every manifest
-file consists of the following sections:
+The `Cargo.toml` file for each package is called its *manifest*. It is written
+in the [TOML] format. Every manifest file consists of the following sections:
 
 * [`cargo-features`](unstable.md) — Unstable, nightly-only features.
 * [`[package]`](#the-package-section) — Defines a package.
@@ -30,6 +30,7 @@ file consists of the following sections:
   * [`autoexamples`](cargo-targets.md#target-auto-discovery) — Disables example auto discovery.
   * [`autotests`](cargo-targets.md#target-auto-discovery) — Disables test auto discovery.
   * [`autobenches`](cargo-targets.md#target-auto-discovery) — Disables bench auto discovery.
+  * [`resolver`](resolver.md#resolver-versions) — Sets the dependency resolver to use.
 * Target tables: (see [configuration](cargo-targets.md#configuring-a-target) for settings)
   * [`[lib]`](cargo-targets.md#library) — Library target settings.
   * [`[[bin]]`](cargo-targets.md#binaries) — Binary target settings.
@@ -41,7 +42,7 @@ file consists of the following sections:
   * [`[dev-dependencies]`](specifying-dependencies.md#development-dependencies) — Dependencies for examples, tests, and benchmarks.
   * [`[build-dependencies]`](specifying-dependencies.md#build-dependencies) — Dependencies for build scripts.
   * [`[target]`](specifying-dependencies.md#platform-specific-dependencies) — Platform-specific dependencies.
-* [`[badges]`](#the-badges-section) — Badges to display on [crates.io].
+* [`[badges]`](#the-badges-section) — Badges to display on a registry.
 * [`[features]`](features.md) — Conditional compilation features.
 * [`[patch]`](overriding-dependencies.md#the-patch-section) — Override dependencies.
 * [`[replace]`](overriding-dependencies.md#the-replace-section) — Override dependencies (deprecated).
@@ -95,6 +96,15 @@ Versioning](https://semver.org/), so make sure you follow some basic rules:
   traits, fields, types, functions, methods or anything else.
 * Use version numbers with three numeric parts such as 1.0.0 rather than 1.0.
 
+See the [Resolver] chapter for more information on how Cargo uses versions to
+resolve dependencies, and for guidelines on setting your own version. See the
+[Semver compatibility] chapter for more details on exactly what constitutes a
+breaking change.
+
+[Resolver]: resolver.md
+[Semver compatibility]: semver.md
+
+<a id="the-authors-field-optional"></a>
 #### The `authors` field
 
 The `authors` field lists people or organizations that are considered the
@@ -106,11 +116,13 @@ brackets at the end of each author.
 
 > **Note**: [crates.io] requires at least one author to be listed.
 
+<a id="the-edition-field-optional"></a>
 #### The `edition` field
 
-You can opt in to a specific [Rust Edition] for your package with the
-`edition` key in `Cargo.toml`. If you don't specify the edition, it will
-default to 2015.
+The `edition` key is an optional key that affects which [Rust Edition] your package
+is compiled with. Setting the `edition` key in `[package]` will affect all
+targets/crates in the package, including test suites, benchmarks, binaries,
+examples, etc.
 
 ```toml
 [package]
@@ -118,11 +130,14 @@ default to 2015.
 edition = '2018'
 ```
 
-The `edition` key affects which edition your package is compiled with. Cargo
-will always generate packages via [`cargo new`] with the `edition` key set to the
-latest edition. Setting the `edition` key in `[package]` will affect all
-targets/crates in the package, including test suites, benchmarks, binaries,
-examples, etc.
+Most manifests have the `edition` field filled in automatically by [`cargo new`]
+with the latest stable edition. By default `cargo new` creates a manifest with
+the 2018 edition currently.
+
+If the `edition` field is not present in `Cargo.toml`, then the 2015 edition is
+assumed for backwards compatibility. Note that all manifests
+created with [`cargo new`] will not use this historical fallback because they
+will have `edition` explicitly specified to a newer value.
 
 #### The `description` field
 
@@ -137,6 +152,7 @@ description = "A short description of my package"
 
 > **Note**: [crates.io] requires the `description` to be set.
 
+<a id="the-documentation-field-optional"></a>
 #### The `documentation` field
 
 The `documentation` field specifies a URL to a website hosting the crate's
@@ -148,10 +164,6 @@ automatically link your crate to the corresponding [docs.rs] page.
 # ...
 documentation = "https://docs.rs/bitflags"
 ```
-
-> **Note**: [crates.io] may not show certain sites if they are known to not be
-> hosting documentation and are possibly of malicious intent e.g., ad tracking
-> networks. At this time, the site `rust-ci.org` is not allowed.
 
 #### The `readme` field
 
@@ -165,6 +177,12 @@ will interpret it as Markdown and render it on the crate's page.
 # ...
 readme = "README.md"
 ```
+
+If no value is specified for this field, and a file named `README.md`,
+`README.txt` or `README` exists in the package root, then the name of that
+file will be used. You can suppress this behavior by setting this field to
+`false`. If the field is set to `true`, a default value of `README.md` will
+be assumed.
 
 #### The `homepage` field
 
@@ -196,7 +214,7 @@ containing the text of the license (relative to this `Cargo.toml`).
 
 [crates.io] interprets the `license` field as an [SPDX 2.1 license
 expression][spdx-2.1-license-expressions]. The name must be a known license
-from the [SPDX license list 3.6][spdx-license-list-3.6]. Parentheses are not
+from the [SPDX license list 3.11][spdx-license-list-3.11]. Parentheses are not
 currently supported. See the [SPDX site] for more information.
 
 SPDX license expressions support AND and OR operators to combine multiple
@@ -213,8 +231,8 @@ the user must comply with both licenses simultaneously. The `WITH` operator
 indicates a license with a special exception. Some examples:
 
 * `MIT OR Apache-2.0`
-* `LGPL-2.1 AND MIT AND BSD-2-Clause`
-* `GPL-2.0+ WITH Bison-exception-2.2`
+* `LGPL-2.1-only AND MIT AND BSD-2-Clause`
+* `GPL-2.0-or-later WITH Bison-exception-2.2`
 
 If a package is using a nonstandard license, then the `license-file` field may
 be specified in lieu of the `license` field.
@@ -259,6 +277,7 @@ categories = ["command-line-utilities", "development-tools::cargo-plugins"]
 > match one of the strings available at <https://crates.io/category_slugs>, and
 > must match exactly.
 
+<a id="the-workspace--field-optional"></a>
 #### The `workspace` field
 
 The `workspace` field can be used to configure the workspace that this package
@@ -280,6 +299,7 @@ table defined. That is, a crate cannot both be a root crate in a workspace
 For more information, see the [workspaces chapter](workspaces.md).
 
 <a id="package-build"></a>
+<a id="the-build-field-optional"></a>
 #### The `build` field
 
 The `build` field specifies a file in the package root which is a [build
@@ -299,6 +319,7 @@ The default is `"build.rs"`, which loads the script from a file named
 specify a path to a different file or `build = false` to disable automatic
 detection of the build script.
 
+<a id="the-links-field-optional"></a>
 #### The `links` field
 
 The `links` field specifies the name of a native library that is being linked
@@ -313,6 +334,7 @@ script guide.
 links = "foo"
 ```
 
+<a id="the-exclude-and-include-fields-optional"></a>
 #### The `exclude` and `include` fields
 
 You can explicitly specify that a set of file patterns should be ignored or
@@ -375,6 +397,7 @@ if any of those files change.
 
 [gitignore]: https://git-scm.com/docs/gitignore
 
+<a id="the-publish--field-optional"></a>
 #### The `publish` field
 
 The `publish` field can be used to prevent a package from being published to a
@@ -396,6 +419,10 @@ allowed to be published to.
 publish = ["some-registry-name"]
 ```
 
+If publish array contains a single registry, `cargo publish` command will use
+it when `--registry` flag is not specified.
+
+<a id="the-metadata-table-optional"></a>
 #### The `metadata` table
 
 Cargo by default will warn about unused keys in `Cargo.toml` to assist in
@@ -415,6 +442,15 @@ package-name = "my-awesome-android-app"
 assets = "path/to/static"
 ```
 
+There is a similar table at the workspace level at
+[`workspace.metadata`][workspace-metadata]. While cargo does not specify a
+format for the content of either of these tables, it is suggested that
+external tools may wish to use them in a consistent fashion, such as referring
+to the data in `workspace.metadata` if data is missing from `package.metadata`,
+if that makes sense for the tool in question.
+
+[workspace-metadata]: workspaces.md#the-workspacemetadata-table
+
 #### The `default-run` field
 
 The `default-run` field in the `[package]` section of the manifest can be used
@@ -428,66 +464,22 @@ default-run = "a"
 
 ### The `[badges]` section
 
-[crates.io] can display various badges for build status, test coverage, etc. for
-each crate. All badges are optional.
+The `[badges]` section is for specifying status badges that can be displayed
+on a registry website when the package is published.
 
-- The badges pertaining to build status that are currently available are
-  Appveyor, CircleCI, Cirrus CI, GitLab, Azure DevOps, Travis CI and Bitbucket
-  Pipelines.
-- Available badges pertaining to code test coverage are Codecov and Coveralls.
-- There are also maintenance-related badges based on isitmaintained.com
-  which state the issue resolution time, percent of open issues, and future
-  maintenance intentions.
-
-Most badge specifications require a `repository` key. It is expected to be in
-`user/repo` format.
+> Note: [crates.io] previously displayed badges next to a crate on its
+> website, but that functionality has been removed. Packages should place
+> badges in its README file which will be displayed on [crates.io] (see [the
+> `readme` field](#the-readme-field)).
 
 ```toml
 [badges]
-
-# Appveyor: `repository` is required. `branch` is optional; default is `master`
-# `service` is optional; valid values are `github` (default), `bitbucket`, and
-# `gitlab`; `id` is optional; you can specify the appveyor project id if you
-# want to use that instead. `project_name` is optional; use when the repository
-# name differs from the appveyor project name.
-appveyor = { repository = "...", branch = "master", service = "github" }
-
-# Circle CI: `repository` is required. `branch` is optional; default is `master`
-circle-ci = { repository = "...", branch = "master" }
-
-# Cirrus CI: `repository` is required. `branch` is optional; default is `master`
-cirrus-ci = { repository = "...", branch = "master" }
-
-# GitLab: `repository` is required. `branch` is optional; default is `master`
-gitlab = { repository = "...", branch = "master" }
-
-# Azure DevOps: `project` is required. `pipeline` is required. `build` is optional; default is `1`
-# Note: project = `organization/project`, pipeline = `name_of_pipeline`, build = `definitionId`
-azure-devops = { project = "...", pipeline = "...", build="2" }
-
-# Travis CI: `repository` in format "<user>/<project>" is required.
-# `branch` is optional; default is `master`
-travis-ci = { repository = "...", branch = "master" }
-
-# Bitbucket Pipelines: `repository` is required. `branch` is required
-bitbucket-pipelines = { repository = "...", branch = "master" }
-
-# Codecov: `repository` is required. `branch` is optional; default is `master`
-# `service` is optional; valid values are `github` (default), `bitbucket`, and
-# `gitlab`.
-codecov = { repository = "...", branch = "master", service = "github" }
-
-# Coveralls: `repository` is required. `branch` is optional; default is `master`
-# `service` is optional; valid values are `github` (default) and `bitbucket`.
-coveralls = { repository = "...", branch = "master", service = "github" }
-
-# Is it maintained resolution time: `repository` is required.
-is-it-maintained-issue-resolution = { repository = "..." }
-
-# Is it maintained percentage of open issues: `repository` is required.
-is-it-maintained-open-issues = { repository = "..." }
-
-# Maintenance: `status` is required. Available options are:
+# The `maintenance` table indicates the status of the maintenance of
+# the crate. This may be used by a registry, but is currently not
+# used by crates.io. See https://github.com/rust-lang/crates.io/issues/2437
+# and https://github.com/rust-lang/crates.io/issues/2438 for more details.
+#
+# The `status` field is required. Available options are:
 # - `actively-developed`: New features are being added and bugs are being fixed.
 # - `passively-maintained`: There are no plans for new features, but the maintainer intends to
 #   respond to issues that get filed.
@@ -527,8 +519,9 @@ more detail.
 [publishing]: publishing.md
 [Rust Edition]: ../../edition-guide/index.html
 [spdx-2.1-license-expressions]: https://spdx.org/spdx-specification-21-web-version#h.jxpfx0ykyb60
-[spdx-license-list-3.6]: https://github.com/spdx/license-list-data/tree/v3.6
+[spdx-license-list-3.11]: https://github.com/spdx/license-list-data/tree/v3.11
 [SPDX site]: https://spdx.org/license-list
+[TOML]: https://toml.io/
 
 <script>
 (function() {
@@ -539,15 +532,15 @@ more detail.
         "#integration-tests": "cargo-targets.html#integration-tests",
         "#configuring-a-target": "cargo-targets.html#configuring-a-target",
         "#target-auto-discovery": "cargo-targets.html#target-auto-discovery",
-        "#the-required-features-field": "cargo-targets.html#the-required-features-field",
+        "#the-required-features-field-optional": "cargo-targets.html#the-required-features-field",
         "#building-dynamic-or-static-libraries": "cargo-targets.html#the-crate-type-field",
         "#the-workspace-section": "workspaces.html#the-workspace-section",
         "#virtual-manifest": "workspaces.html",
         "#package-selection": "workspaces.html#package-selection",
         "#the-features-section": "features.html#the-features-section",
-        "#rules": "features.html#rules",
-        "#usage-in-end-products": "features.html#usage-in-end-products",
-        "#usage-in-packages": "features.html#usage-in-packages",
+        "#rules": "features.html",
+        "#usage-in-end-products": "features.html",
+        "#usage-in-packages": "features.html",
         "#the-patch-section": "overriding-dependencies.html#the-patch-section",
         "#using-patch-with-multiple-versions": "overriding-dependencies.html#using-patch-with-multiple-versions",
         "#the-replace-section": "overriding-dependencies.html#the-replace-section",

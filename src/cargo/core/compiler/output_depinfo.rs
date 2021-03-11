@@ -23,7 +23,6 @@
 //! be detected via changes to `Cargo.lock`.
 
 use std::collections::{BTreeSet, HashSet};
-use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
@@ -48,13 +47,13 @@ fn render_filename<P: AsRef<Path>>(path: P, basedir: Option<&str>) -> CargoResul
         .map(|f| f.replace(" ", "\\ "))
 }
 
-fn add_deps_for_unit<'a, 'b>(
+fn add_deps_for_unit(
     deps: &mut BTreeSet<PathBuf>,
-    cx: &mut Context<'a, 'b>,
-    unit: &Unit<'a>,
-    visited: &mut HashSet<Unit<'a>>,
+    cx: &mut Context<'_, '_>,
+    unit: &Unit,
+    visited: &mut HashSet<Unit>,
 ) -> CargoResult<()> {
-    if !visited.insert(*unit) {
+    if !visited.insert(unit.clone()) {
         return Ok(());
     }
 
@@ -66,7 +65,7 @@ fn add_deps_for_unit<'a, 'b>(
         if let Some(paths) =
             fingerprint::parse_dep_info(unit.pkg.root(), cx.files().host_root(), &dep_info_loc)?
         {
-            for path in paths {
+            for path in paths.files {
                 deps.insert(path);
             }
         } else {
@@ -80,13 +79,8 @@ fn add_deps_for_unit<'a, 'b>(
     }
 
     // Add rerun-if-changed dependencies
-    if let Some(metadata) = cx.find_build_script_metadata(*unit) {
-        if let Some(output) = cx
-            .build_script_outputs
-            .lock()
-            .unwrap()
-            .get(unit.pkg.package_id(), metadata)
-        {
+    if let Some(metadata) = cx.find_build_script_metadata(unit) {
+        if let Some(output) = cx.build_script_outputs.lock().unwrap().get(metadata) {
             for path in &output.rerun_if_changed {
                 deps.insert(path.into());
             }
@@ -96,8 +90,7 @@ fn add_deps_for_unit<'a, 'b>(
     // Recursively traverse all transitive dependencies
     let unit_deps = Vec::from(cx.unit_deps(unit)); // Create vec due to mutable borrow.
     for dep in unit_deps {
-        let source_id = dep.unit.pkg.package_id().source_id();
-        if source_id.is_path() {
+        if unit.is_local() {
             add_deps_for_unit(deps, cx, &dep.unit, visited)?;
         }
     }
@@ -107,7 +100,7 @@ fn add_deps_for_unit<'a, 'b>(
 /// Save a `.d` dep-info file for the given unit.
 ///
 /// This only saves files for uplifted artifacts.
-pub fn output_depinfo<'a, 'b>(cx: &mut Context<'a, 'b>, unit: &Unit<'a>) -> CargoResult<()> {
+pub fn output_depinfo(cx: &mut Context<'_, '_>, unit: &Unit) -> CargoResult<()> {
     let bcx = cx.bcx;
     let mut deps = BTreeSet::new();
     let mut visited = HashSet::new();
@@ -133,7 +126,7 @@ pub fn output_depinfo<'a, 'b>(cx: &mut Context<'a, 'b>, unit: &Unit<'a>) -> Carg
     for output in cx
         .outputs(unit)?
         .iter()
-        .filter(|o| o.flavor != FileFlavor::DebugInfo)
+        .filter(|o| !matches!(o.flavor, FileFlavor::DebugInfo | FileFlavor::Auxiliary))
     {
         if let Some(ref link_dst) = output.hardlink {
             let output_path = link_dst.with_extension("d");
@@ -143,13 +136,13 @@ pub fn output_depinfo<'a, 'b>(cx: &mut Context<'a, 'b>, unit: &Unit<'a>) -> Carg
                 // If nothing changed don't recreate the file which could alter
                 // its mtime
                 if let Ok(previous) = fingerprint::parse_rustc_dep_info(&output_path) {
-                    if previous.len() == 1 && previous[0].0 == target_fn && previous[0].1 == deps {
+                    if previous.files.iter().eq(deps.iter().map(Path::new)) {
                         continue;
                     }
                 }
 
                 // Otherwise write it all out
-                let mut outfile = BufWriter::new(File::create(output_path)?);
+                let mut outfile = BufWriter::new(paths::create(output_path)?);
                 write!(outfile, "{}:", target_fn)?;
                 for dep in &deps {
                     write!(outfile, " {}", dep)?;

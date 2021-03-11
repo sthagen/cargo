@@ -1,17 +1,15 @@
-#![allow(deprecated)] // for SipHasher
-
-use std::collections::hash_map::{Entry, HashMap};
+use std::collections::hash_map::HashMap;
 use std::env;
-use std::hash::{Hash, Hasher, SipHasher};
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 
-use crate::core::InternedString;
+use crate::util::interning::InternedString;
 use crate::util::paths;
-use crate::util::{self, profile, CargoResult, CargoResultExt, ProcessBuilder};
+use crate::util::{self, profile, CargoResult, CargoResultExt, ProcessBuilder, StableHasher};
 
 /// Information on the `rustc` executable
 #[derive(Debug)]
@@ -20,9 +18,13 @@ pub struct Rustc {
     pub path: PathBuf,
     /// An optional program that will be passed the path of the rust exe as its first argument, and
     /// rustc args following this.
-    pub wrapper: Option<ProcessBuilder>,
+    pub wrapper: Option<PathBuf>,
+    /// An optional wrapper to be used in addition to `rustc.wrapper` for workspace crates
+    pub workspace_wrapper: Option<PathBuf>,
     /// Verbose version information (the output of `rustc -vV`)
     pub verbose_version: String,
+    /// The rustc version (`1.23.4-beta.2`), this comes from verbose_version.
+    pub version: semver::Version,
     /// The host triple (arch-platform-OS), this comes from verbose_version.
     pub host: InternedString,
     cache: Mutex<Cache>,
@@ -37,6 +39,7 @@ impl Rustc {
     pub fn new(
         path: PathBuf,
         wrapper: Option<PathBuf>,
+        workspace_wrapper: Option<PathBuf>,
         rustup_rustc: &Path,
         cache_location: Option<PathBuf>,
     ) -> CargoResult<Rustc> {
@@ -46,58 +49,76 @@ impl Rustc {
 
         let mut cmd = util::process(&path);
         cmd.arg("-vV");
-        let verbose_version = cache.cached_output(&cmd)?.0;
+        let verbose_version = cache.cached_output(&cmd, 0)?.0;
 
-        let host = {
-            let triple = verbose_version
+        let extract = |field: &str| -> CargoResult<&str> {
+            verbose_version
                 .lines()
-                .find(|l| l.starts_with("host: "))
-                .map(|l| &l[6..])
+                .find(|l| l.starts_with(field))
+                .map(|l| &l[field.len()..])
                 .ok_or_else(|| {
                     anyhow::format_err!(
-                        "`rustc -vV` didn't have a line for `host:`, got:\n{}",
+                        "`rustc -vV` didn't have a line for `{}`, got:\n{}",
+                        field.trim(),
                         verbose_version
                     )
-                })?;
-            InternedString::new(triple)
+                })
         };
+
+        let host = InternedString::new(extract("host: ")?);
+        let version = semver::Version::parse(extract("release: ")?).chain_err(|| {
+            format!(
+                "rustc version does not appear to be a valid semver version, from:\n{}",
+                verbose_version
+            )
+        })?;
 
         Ok(Rustc {
             path,
-            wrapper: wrapper.map(util::process),
+            wrapper,
+            workspace_wrapper,
             verbose_version,
+            version,
             host,
             cache: Mutex::new(cache),
         })
     }
 
     /// Gets a process builder set up to use the found rustc version, with a wrapper if `Some`.
-    pub fn process_with(&self, path: impl AsRef<Path>) -> ProcessBuilder {
-        match self.wrapper {
-            Some(ref wrapper) if !wrapper.get_program().is_empty() => {
-                let mut cmd = wrapper.clone();
-                cmd.arg(path.as_ref());
-                cmd
-            }
-            _ => util::process(path.as_ref()),
-        }
+    pub fn process(&self) -> ProcessBuilder {
+        util::process(self.path.as_path()).wrapped(self.wrapper.as_ref())
     }
 
     /// Gets a process builder set up to use the found rustc version, with a wrapper if `Some`.
-    pub fn process(&self) -> ProcessBuilder {
-        self.process_with(&self.path)
+    pub fn workspace_process(&self) -> ProcessBuilder {
+        util::process(self.path.as_path())
+            .wrapped(self.workspace_wrapper.as_ref())
+            .wrapped(self.wrapper.as_ref())
     }
 
     pub fn process_no_wrapper(&self) -> ProcessBuilder {
         util::process(&self.path)
     }
 
-    pub fn cached_output(&self, cmd: &ProcessBuilder) -> CargoResult<(String, String)> {
-        self.cache.lock().unwrap().cached_output(cmd)
-    }
-
-    pub fn set_wrapper(&mut self, wrapper: ProcessBuilder) {
-        self.wrapper = Some(wrapper);
+    /// Gets the output for the given command.
+    ///
+    /// This will return the cached value if available, otherwise it will run
+    /// the command and cache the output.
+    ///
+    /// `extra_fingerprint` is extra data to include in the cache fingerprint.
+    /// Use this if there is other information about the environment that may
+    /// affect the output that is not part of `cmd`.
+    ///
+    /// Returns a tuple of strings `(stdout, stderr)`.
+    pub fn cached_output(
+        &self,
+        cmd: &ProcessBuilder,
+        extra_fingerprint: u64,
+    ) -> CargoResult<(String, String)> {
+        self.cache
+            .lock()
+            .unwrap()
+            .cached_output(cmd, extra_fingerprint)
     }
 }
 
@@ -119,8 +140,17 @@ struct Cache {
 #[derive(Serialize, Deserialize, Debug, Default)]
 struct CacheData {
     rustc_fingerprint: u64,
-    outputs: HashMap<u64, (String, String)>,
+    outputs: HashMap<u64, Output>,
     successes: HashMap<u64, bool>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct Output {
+    success: bool,
+    status: String,
+    code: Option<i32>,
+    stdout: String,
+    stderr: String,
 }
 
 impl Cache {
@@ -174,28 +204,55 @@ impl Cache {
         }
     }
 
-    fn cached_output(&mut self, cmd: &ProcessBuilder) -> CargoResult<(String, String)> {
-        let key = process_fingerprint(cmd);
-        match self.data.outputs.entry(key) {
-            Entry::Occupied(entry) => {
-                debug!("rustc info cache hit");
-                Ok(entry.get().clone())
-            }
-            Entry::Vacant(entry) => {
-                debug!("rustc info cache miss");
-                debug!("running {}", cmd);
-                let output = cmd.exec_with_output()?;
-                let stdout = String::from_utf8(output.stdout)
-                    .map_err(|e| anyhow::anyhow!("{}: {:?}", e, e.as_bytes()))
-                    .chain_err(|| anyhow::anyhow!("`{}` didn't return utf8 output", cmd))?;
-                let stderr = String::from_utf8(output.stderr)
-                    .map_err(|e| anyhow::anyhow!("{}: {:?}", e, e.as_bytes()))
-                    .chain_err(|| anyhow::anyhow!("`{}` didn't return utf8 output", cmd))?;
-                let output = (stdout, stderr);
-                entry.insert(output.clone());
-                self.dirty = true;
-                Ok(output)
-            }
+    fn cached_output(
+        &mut self,
+        cmd: &ProcessBuilder,
+        extra_fingerprint: u64,
+    ) -> CargoResult<(String, String)> {
+        let key = process_fingerprint(cmd, extra_fingerprint);
+        if self.data.outputs.contains_key(&key) {
+            debug!("rustc info cache hit");
+        } else {
+            debug!("rustc info cache miss");
+            debug!("running {}", cmd);
+            let output = cmd
+                .build_command()
+                .output()
+                .chain_err(|| format!("could not execute process {} (never executed)", cmd))?;
+            let stdout = String::from_utf8(output.stdout)
+                .map_err(|e| anyhow::anyhow!("{}: {:?}", e, e.as_bytes()))
+                .chain_err(|| anyhow::anyhow!("`{}` didn't return utf8 output", cmd))?;
+            let stderr = String::from_utf8(output.stderr)
+                .map_err(|e| anyhow::anyhow!("{}: {:?}", e, e.as_bytes()))
+                .chain_err(|| anyhow::anyhow!("`{}` didn't return utf8 output", cmd))?;
+            self.data.outputs.insert(
+                key,
+                Output {
+                    success: output.status.success(),
+                    status: if output.status.success() {
+                        String::new()
+                    } else {
+                        util::exit_status_to_string(output.status)
+                    },
+                    code: output.status.code(),
+                    stdout,
+                    stderr,
+                },
+            );
+            self.dirty = true;
+        }
+        let output = &self.data.outputs[&key];
+        if output.success {
+            Ok((output.stdout.clone(), output.stderr.clone()))
+        } else {
+            Err(util::process_error_raw(
+                &format!("process didn't exit successfully: {}", cmd),
+                output.code,
+                &output.status,
+                Some(output.stdout.as_ref()),
+                Some(output.stderr.as_ref()),
+            )
+            .into())
         }
     }
 }
@@ -216,7 +273,7 @@ impl Drop for Cache {
 }
 
 fn rustc_fingerprint(path: &Path, rustup_rustc: &Path) -> CargoResult<u64> {
-    let mut hasher = SipHasher::new_with_keys(0, 0);
+    let mut hasher = StableHasher::new();
 
     let path = paths::resolve_executable(path)?;
     path.hash(&mut hasher);
@@ -259,8 +316,9 @@ fn rustc_fingerprint(path: &Path, rustup_rustc: &Path) -> CargoResult<u64> {
     Ok(hasher.finish())
 }
 
-fn process_fingerprint(cmd: &ProcessBuilder) -> u64 {
-    let mut hasher = SipHasher::new_with_keys(0, 0);
+fn process_fingerprint(cmd: &ProcessBuilder, extra_fingerprint: u64) -> u64 {
+    let mut hasher = StableHasher::new();
+    extra_fingerprint.hash(&mut hasher);
     cmd.get_args().hash(&mut hasher);
     let mut env = cmd.get_envs().iter().collect::<Vec<_>>();
     env.sort_unstable();

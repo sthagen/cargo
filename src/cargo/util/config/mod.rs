@@ -49,10 +49,12 @@
 //! translate from `ConfigValue` and environment variables to the caller's
 //! desired type.
 
+use std::borrow::Cow;
 use std::cell::{RefCell, RefMut};
 use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File};
 use std::io::prelude::*;
@@ -63,15 +65,16 @@ use std::str::FromStr;
 use std::sync::Once;
 use std::time::Instant;
 
-use anyhow::{anyhow, bail};
+use anyhow::{anyhow, bail, format_err};
 use curl::easy::Easy;
 use lazycell::LazyCell;
 use serde::Deserialize;
 use url::Url;
 
 use self::ConfigValue as CV;
+use crate::core::compiler::rustdoc::RustdocExternMap;
 use crate::core::shell::Verbosity;
-use crate::core::{nightly_features_allowed, CliUnstable, Shell, SourceId, Workspace};
+use crate::core::{features, CliUnstable, Shell, SourceId, Workspace};
 use crate::ops;
 use crate::util::errors::{CargoResult, CargoResultExt};
 use crate::util::toml as cargo_toml;
@@ -121,7 +124,7 @@ macro_rules! get_value_typed {
 /// relating to cargo itself.
 #[derive(Debug)]
 pub struct Config {
-    /// The location of the user's 'home' directory. OS-dependent.
+    /// The location of the user's Cargo home directory. OS-dependent.
     home_path: Filesystem,
     /// Information about how to write messages to the shell
     shell: RefCell<Shell>,
@@ -131,6 +134,8 @@ pub struct Config {
     cli_config: Option<Vec<String>>,
     /// The current working directory of cargo
     cwd: PathBuf,
+    /// Directory where config file searching should stop (inclusive).
+    search_stop_path: Option<PathBuf>,
     /// The location of the cargo executable (path to current process)
     cargo_exe: LazyCell<PathBuf>,
     /// The location of the rustdoc executable
@@ -148,8 +153,10 @@ pub struct Config {
     offline: bool,
     /// A global static IPC control mechanism (used for managing parallel builds)
     jobserver: Option<jobserver::Client>,
-    /// Cli flags of the form "-Z something"
+    /// Cli flags of the form "-Z something" merged with config file values
     unstable_flags: CliUnstable,
+    /// Cli flags of the form "-Z something"
+    unstable_flags_cli: Option<Vec<String>>,
     /// A handle on curl easy mode for http calls
     easy: LazyCell<RefCell<Easy>>,
     /// Cache of the `SourceId` for crates.io
@@ -162,6 +169,8 @@ pub struct Config {
     target_dir: Option<Filesystem>,
     /// Environment variables, separated to assist testing.
     env: HashMap<String, String>,
+    /// Environment variables, converted to uppercase to check for case mismatch
+    upper_case_env: HashMap<String, String>,
     /// Tracks which sources have been updated to avoid multiple updates.
     updated_sources: LazyCell<RefCell<HashSet<SourceId>>>,
     /// Lock, if held, of the global package cache along with the number of
@@ -172,6 +181,25 @@ pub struct Config {
     net_config: LazyCell<CargoNetConfig>,
     build_config: LazyCell<CargoBuildConfig>,
     target_cfgs: LazyCell<Vec<(String, TargetCfgConfig)>>,
+    doc_extern_map: LazyCell<RustdocExternMap>,
+    progress_config: ProgressConfig,
+    env_config: LazyCell<EnvConfig>,
+    /// This should be false if:
+    /// - this is an artifact of the rustc distribution process for "stable" or for "beta"
+    /// - this is an `#[test]` that does not opt in with `enable_nightly_features`
+    /// - this is a integration test that uses `ProcessBuilder`
+    ///      that does not opt in with `masquerade_as_nightly_cargo`
+    /// This should be true if:
+    /// - this is an artifact of the rustc distribution process for "nightly"
+    /// - this is being used in the rustc distribution process internally
+    /// - this is a cargo executable that was built from source
+    /// - this is an `#[test]` that called `enable_nightly_features`
+    /// - this is a integration test that uses `ProcessBuilder`
+    ///       that called `masquerade_as_nightly_cargo`
+    /// It's public to allow tests use nightly features.
+    /// NOTE: this should be set before `configure()`. If calling this from an integration test,
+    /// consider using `ConfigBuilder::enable_nightly_features` instead.
+    pub nightly_features_allowed: bool,
 }
 
 impl Config {
@@ -204,6 +232,15 @@ impl Config {
             })
             .collect();
 
+        let upper_case_env = if cfg!(windows) {
+            HashMap::new()
+        } else {
+            env.clone()
+                .into_iter()
+                .map(|(k, _)| (k.to_uppercase().replace("-", "_"), k))
+                .collect()
+        };
+
         let cache_rustc_info = match env.get("CARGO_CACHE_RUSTC_INFO") {
             Some(cache) => cache != "0",
             _ => true,
@@ -213,6 +250,7 @@ impl Config {
             home_path: Filesystem::new(homedir),
             shell: RefCell::new(shell),
             cwd,
+            search_stop_path: None,
             values: LazyCell::new(),
             cli_config: None,
             cargo_exe: LazyCell::new(),
@@ -229,18 +267,24 @@ impl Config {
                 }
             },
             unstable_flags: CliUnstable::default(),
+            unstable_flags_cli: None,
             easy: LazyCell::new(),
             crates_io_source_id: LazyCell::new(),
             cache_rustc_info,
             creation_time: Instant::now(),
             target_dir: None,
             env,
+            upper_case_env,
             updated_sources: LazyCell::new(),
             package_cache_lock: RefCell::new(None),
             http_config: LazyCell::new(),
             net_config: LazyCell::new(),
             build_config: LazyCell::new(),
             target_cfgs: LazyCell::new(),
+            doc_extern_map: LazyCell::new(),
+            progress_config: ProgressConfig::default(),
+            env_config: LazyCell::new(),
+            nightly_features_allowed: matches!(&*features::channel(), "nightly" | "dev"),
         }
     }
 
@@ -288,10 +332,9 @@ impl Config {
 
     /// Gets the default Cargo registry.
     pub fn default_registry(&self) -> CargoResult<Option<String>> {
-        Ok(match self.get_string("registry.default")? {
-            Some(registry) => Some(registry.val),
-            None => None,
-        })
+        Ok(self
+            .get_string("registry.default")?
+            .map(|registry| registry.val))
     }
 
     /// Gets a reference to the shell, e.g., for writing error messages.
@@ -314,9 +357,15 @@ impl Config {
                 .into_path_unlocked()
         });
         let wrapper = self.maybe_get_tool("rustc_wrapper", &self.build_config()?.rustc_wrapper);
+        let rustc_workspace_wrapper = self.maybe_get_tool(
+            "rustc_workspace_wrapper",
+            &self.build_config()?.rustc_workspace_wrapper,
+        );
+
         Rustc::new(
             self.get_tool("rustc", &self.build_config()?.rustc),
             wrapper,
+            rustc_workspace_wrapper,
             &self
                 .home()
                 .join("bin")
@@ -408,12 +457,21 @@ impl Config {
         }
     }
 
+    /// Sets the path where ancestor config file searching will stop. The
+    /// given path is included, but its ancestors are not.
+    pub fn set_search_stop_path<P: Into<PathBuf>>(&mut self, path: P) {
+        let path = path.into();
+        debug_assert!(self.cwd.starts_with(&path));
+        self.search_stop_path = Some(path);
+    }
+
     /// Reloads on-disk configuration values, starting at the given path and
     /// walking up its ancestors.
     pub fn reload_rooted_at<P: AsRef<Path>>(&mut self, path: P) -> CargoResult<()> {
         let values = self.load_values_from(path.as_ref())?;
         self.values.replace(values);
         self.merge_cli_args()?;
+        self.load_unstable_flags_from_config()?;
         Ok(())
     }
 
@@ -430,11 +488,28 @@ impl Config {
     pub fn target_dir(&self) -> CargoResult<Option<Filesystem>> {
         if let Some(dir) = &self.target_dir {
             Ok(Some(dir.clone()))
-        } else if let Some(dir) = env::var_os("CARGO_TARGET_DIR") {
+        } else if let Some(dir) = self.env.get("CARGO_TARGET_DIR") {
+            // Check if the CARGO_TARGET_DIR environment variable is set to an empty string.
+            if dir.is_empty() {
+                bail!(
+                    "the target directory is set to an empty string in the \
+                     `CARGO_TARGET_DIR` environment variable"
+                )
+            }
+
             Ok(Some(Filesystem::new(self.cwd.join(dir))))
         } else if let Some(val) = &self.build_config()?.target_dir {
-            let val = val.resolve_path(self);
-            Ok(Some(Filesystem::new(val)))
+            let path = val.resolve_path(self);
+
+            // Check if the target directory is set to an empty string in the config.toml file.
+            if val.raw_value().is_empty() {
+                bail!(
+                    "the target directory is set to an empty string in {}",
+                    val.value().definition
+                )
+            }
+
+            Ok(Some(Filesystem::new(path)))
         } else {
             Ok(None)
         }
@@ -442,8 +517,8 @@ impl Config {
 
     /// Get a configuration value by key.
     ///
-    /// This does NOT look at environment variables, the caller is responsible
-    /// for that.
+    /// This does NOT look at environment variables. See `get_cv_with_env` for
+    /// a variant that supports environment variables.
     fn get_cv(&self, key: &ConfigKey) -> CargoResult<Option<ConfigValue>> {
         log::trace!("get cv {:?}", key);
         let vals = self.values()?;
@@ -499,7 +574,10 @@ impl Config {
                     definition,
                 }))
             }
-            None => Ok(None),
+            None => {
+                self.check_environment_key_case_mismatch(key);
+                Ok(None)
+            }
         }
     }
 
@@ -519,7 +597,25 @@ impl Config {
                 return true;
             }
         }
+        self.check_environment_key_case_mismatch(key);
+
         false
+    }
+
+    fn check_environment_key_case_mismatch(&self, key: &ConfigKey) {
+        if cfg!(windows) {
+            // In the case of windows the check for case mismatch in keys can be skipped
+            // as windows already converts its environment keys into the desired format.
+            return;
+        }
+
+        if let Some(env_key) = self.upper_case_env.get(key.as_env_key()) {
+            let _ = self.shell().warn(format!(
+                "Environment variables are expected to use uppercase letters and underscores, \
+                the variable `{}` will be ignored and have no effect",
+                env_key
+            ));
+        }
     }
 
     /// Get a string config value.
@@ -574,8 +670,21 @@ impl Config {
     }
 
     /// Helper for StringList type to get something that is a string or list.
-    fn get_list_or_string(&self, key: &ConfigKey) -> CargoResult<Vec<(String, Definition)>> {
+    fn get_list_or_string(
+        &self,
+        key: &ConfigKey,
+        merge: bool,
+    ) -> CargoResult<Vec<(String, Definition)>> {
         let mut res = Vec::new();
+
+        if !merge {
+            self.get_env_list(key, &mut res)?;
+
+            if !res.is_empty() {
+                return Ok(res);
+            }
+        }
+
         match self.get_cv(key)? {
             Some(CV::List(val, _def)) => res.extend(val),
             Some(CV::String(val, def)) => {
@@ -589,6 +698,7 @@ impl Config {
         }
 
         self.get_env_list(key, &mut res)?;
+
         Ok(res)
     }
 
@@ -600,7 +710,10 @@ impl Config {
     ) -> CargoResult<()> {
         let env_val = match self.env.get(key.as_env_key()) {
             Some(v) => v,
-            None => return Ok(()),
+            None => {
+                self.check_environment_key_case_mismatch(key);
+                return Ok(());
+            }
         };
 
         let def = Definition::Environment(key.as_env_key().to_string());
@@ -675,7 +788,17 @@ impl Config {
         unstable_flags: &[String],
         cli_config: &[String],
     ) -> CargoResult<()> {
-        self.unstable_flags.parse(unstable_flags)?;
+        for warning in self
+            .unstable_flags
+            .parse(unstable_flags, self.nightly_features_allowed)?
+        {
+            self.shell().warn(warning)?;
+        }
+        if !unstable_flags.is_empty() {
+            // store a copy of the cli flags separately for `load_unstable_flags_from_config`
+            // (we might also need it again for `reload_rooted_at`)
+            self.unstable_flags_cli = Some(unstable_flags.to_vec());
+        }
         if !cli_config.is_empty() {
             self.unstable_flags.fail_if_stable_opt("--config", 6699)?;
             self.cli_config = Some(cli_config.iter().map(|s| s.to_string()).collect());
@@ -684,16 +807,12 @@ impl Config {
         let extra_verbose = verbose >= 2;
         let verbose = verbose != 0;
 
-        #[derive(Deserialize, Default)]
-        struct TermConfig {
-            verbose: Option<bool>,
-            color: Option<String>,
-        }
-
-        // Ignore errors in the configuration files.
+        // Ignore errors in the configuration files. We don't want basic
+        // commands like `cargo version` to error out due to config file
+        // problems.
         let term = self.get::<TermConfig>("term").unwrap_or_default();
 
-        let color = color.or_else(|| term.color.as_ref().map(|s| s.as_ref()));
+        let color = color.or_else(|| term.color.as_deref());
 
         let verbosity = match (verbose, term.verbose, quiet) {
             (true, _, false) | (_, Some(true), false) => Verbosity::Verbose,
@@ -711,13 +830,11 @@ impl Config {
             (false, _, false) => Verbosity::Normal,
         };
 
-        let cli_target_dir = match target_dir.as_ref() {
-            Some(dir) => Some(Filesystem::new(dir.clone())),
-            None => None,
-        };
+        let cli_target_dir = target_dir.as_ref().map(|dir| Filesystem::new(dir.clone()));
 
         self.shell().set_verbosity(verbosity);
         self.shell().set_color_choice(color)?;
+        self.progress_config = term.progress.unwrap_or_default();
         self.extra_verbose = extra_verbose;
         self.frozen = frozen;
         self.locked = locked;
@@ -729,9 +846,24 @@ impl Config {
                 .unwrap_or(false);
         self.target_dir = cli_target_dir;
 
-        if nightly_features_allowed() {
-            if let Some(val) = self.get::<Option<bool>>("unstable.mtime_on_use")? {
-                self.unstable_flags.mtime_on_use |= val;
+        self.load_unstable_flags_from_config()?;
+
+        Ok(())
+    }
+
+    fn load_unstable_flags_from_config(&mut self) -> CargoResult<()> {
+        // If nightly features are enabled, allow setting Z-flags from config
+        // using the `unstable` table. Ignore that block otherwise.
+        if self.nightly_features_allowed {
+            self.unstable_flags = self
+                .get::<Option<CliUnstable>>("unstable")?
+                .unwrap_or_default();
+            if let Some(unstable_flags_cli) = &self.unstable_flags_cli {
+                // NB. It's not ideal to parse these twice, but doing it again here
+                //     allows the CLI to override config files for both enabling
+                //     and disabling, and doing it up top allows CLI Zflags to
+                //     control config parsing behavior.
+                self.unstable_flags.parse(unstable_flags_cli, true)?;
             }
         }
 
@@ -756,6 +888,10 @@ impl Config {
 
     pub fn frozen(&self) -> bool {
         self.frozen
+    }
+
+    pub fn locked(&self) -> bool {
+        self.locked
     }
 
     pub fn lock_update_allowed(&self) -> bool {
@@ -939,8 +1075,8 @@ impl Config {
         let possible = dir.join(filename_without_extension);
         let possible_with_extension = dir.join(format!("{}.toml", filename_without_extension));
 
-        if fs::metadata(&possible).is_ok() {
-            if warn && fs::metadata(&possible_with_extension).is_ok() {
+        if possible.exists() {
+            if warn && possible_with_extension.exists() {
                 // We don't want to print a warning if the version
                 // without the extension is just a symlink to the version
                 // WITH an extension, which people may want to do to
@@ -963,7 +1099,7 @@ impl Config {
             }
 
             Ok(Some(possible))
-        } else if fs::metadata(&possible_with_extension).is_ok() {
+        } else if possible_with_extension.exists() {
             Ok(Some(possible_with_extension))
         } else {
             Ok(None)
@@ -976,7 +1112,7 @@ impl Config {
     {
         let mut stash: HashSet<PathBuf> = HashSet::new();
 
-        for current in paths::ancestors(pwd) {
+        for current in paths::ancestors(pwd, self.search_stop_path.as_deref()) {
             if let Some(path) = self.get_file_path(&current.join(".cargo"), "config", true)? {
                 walk(&path)?;
                 stash.insert(path);
@@ -998,23 +1134,31 @@ impl Config {
     /// Gets the index for a registry.
     pub fn get_registry_index(&self, registry: &str) -> CargoResult<Url> {
         validate_package_name(registry, "registry name", "")?;
-        Ok(
-            match self.get_string(&format!("registries.{}.index", registry))? {
-                Some(index) => self.resolve_registry_index(index)?,
-                None => bail!("No index found for registry: `{}`", registry),
-            },
-        )
+        if let Some(index) = self.get_string(&format!("registries.{}.index", registry))? {
+            self.resolve_registry_index(&index).chain_err(|| {
+                format!(
+                    "invalid index URL for registry `{}` defined in {}",
+                    registry, index.definition
+                )
+            })
+        } else {
+            bail!("no index found for registry: `{}`", registry);
+        }
     }
 
-    /// Gets the index for the default registry.
-    pub fn get_default_registry_index(&self) -> CargoResult<Option<Url>> {
-        Ok(match self.get_string("registry.index")? {
-            Some(index) => Some(self.resolve_registry_index(index)?),
-            None => None,
-        })
+    /// Returns an error if `registry.index` is set.
+    pub fn check_registry_index_not_set(&self) -> CargoResult<()> {
+        if self.get_string("registry.index")?.is_some() {
+            bail!(
+                "the `registry.index` config value is no longer supported\n\
+                Use `[source]` replacement to alter the default index for crates.io."
+            );
+        }
+        Ok(())
     }
 
-    fn resolve_registry_index(&self, index: Value<String>) -> CargoResult<Url> {
+    fn resolve_registry_index(&self, index: &Value<String>) -> CargoResult<Url> {
+        // This handles relative file: URLs, relative to the config definition.
         let base = index
             .definition
             .root(self)
@@ -1023,7 +1167,7 @@ impl Config {
         let _parsed = index.val.into_url()?;
         let url = index.val.into_url_with_base(Some(&*base))?;
         if url.password().is_some() {
-            bail!("Registry URLs may not contain passwords");
+            bail!("registry URLs may not contain passwords");
         }
         Ok(url)
     }
@@ -1120,17 +1264,36 @@ impl Config {
 
     pub fn http_config(&self) -> CargoResult<&CargoHttpConfig> {
         self.http_config
-            .try_borrow_with(|| Ok(self.get::<CargoHttpConfig>("http")?))
+            .try_borrow_with(|| self.get::<CargoHttpConfig>("http"))
     }
 
     pub fn net_config(&self) -> CargoResult<&CargoNetConfig> {
         self.net_config
-            .try_borrow_with(|| Ok(self.get::<CargoNetConfig>("net")?))
+            .try_borrow_with(|| self.get::<CargoNetConfig>("net"))
     }
 
     pub fn build_config(&self) -> CargoResult<&CargoBuildConfig> {
         self.build_config
-            .try_borrow_with(|| Ok(self.get::<CargoBuildConfig>("build")?))
+            .try_borrow_with(|| self.get::<CargoBuildConfig>("build"))
+    }
+
+    pub fn progress_config(&self) -> &ProgressConfig {
+        &self.progress_config
+    }
+
+    pub fn env_config(&self) -> CargoResult<&EnvConfig> {
+        self.env_config
+            .try_borrow_with(|| self.get::<EnvConfig>("env"))
+    }
+
+    /// This is used to validate the `term` table has valid syntax.
+    ///
+    /// This is necessary because loading the term settings happens very
+    /// early, and in some situations (like `cargo version`) we don't want to
+    /// fail if there are problems with the config file.
+    pub fn validate_term_config(&self) -> CargoResult<()> {
+        drop(self.get::<TermConfig>("term")?);
+        Ok(())
     }
 
     /// Returns a list of [target.'cfg()'] tables.
@@ -1139,6 +1302,14 @@ impl Config {
     pub fn target_cfgs(&self) -> CargoResult<&Vec<(String, TargetCfgConfig)>> {
         self.target_cfgs
             .try_borrow_with(|| target::load_target_cfgs(self))
+    }
+
+    pub fn doc_extern_map(&self) -> CargoResult<&RustdocExternMap> {
+        // Note: This does not support environment variables. The `Unit`
+        // fundamentally does not have access to the registry name, so there is
+        // nothing to query. Plumbing the name into SourceId is quite challenging.
+        self.doc_extern_map
+            .try_borrow_with(|| self.get::<RustdocExternMap>("doc.extern-map"))
     }
 
     /// Returns the `[target]` table definition for the given target triple.
@@ -1423,12 +1594,10 @@ impl ConfigValue {
     fn merge(&mut self, from: ConfigValue, force: bool) -> CargoResult<()> {
         match (self, from) {
             (&mut CV::List(ref mut old, _), CV::List(ref mut new, _)) => {
-                let new = mem::replace(new, Vec::new());
-                old.extend(new.into_iter());
+                old.extend(mem::take(new).into_iter());
             }
             (&mut CV::Table(ref mut old, _), CV::Table(ref mut new, _)) => {
-                let new = mem::replace(new, HashMap::new());
-                for (key, value) in new {
+                for (key, value) in mem::take(new) {
                     match old.entry(key.clone()) {
                         Occupied(mut entry) => {
                             let new_def = value.definition().clone();
@@ -1542,7 +1711,11 @@ pub fn homedir(cwd: &Path) -> Option<PathBuf> {
     ::home::cargo_home_with_cwd(cwd).ok()
 }
 
-pub fn save_credentials(cfg: &Config, token: String, registry: Option<String>) -> CargoResult<()> {
+pub fn save_credentials(
+    cfg: &Config,
+    token: Option<String>,
+    registry: Option<&str>,
+) -> CargoResult<()> {
     // If 'credentials.toml' exists, we should write to that, otherwise
     // use the legacy 'credentials'. There's no need to print the warning
     // here, because it would already be printed at load time.
@@ -1559,25 +1732,6 @@ pub fn save_credentials(cfg: &Config, token: String, registry: Option<String>) -
         cfg.home_path.create_dir()?;
         cfg.home_path
             .open_rw(filename, cfg, "credentials' config file")?
-    };
-
-    let (key, mut value) = {
-        let key = "token".to_string();
-        let value = ConfigValue::String(token, Definition::Path(file.path().to_path_buf()));
-        let mut map = HashMap::new();
-        map.insert(key, value);
-        let table = CV::Table(map, Definition::Path(file.path().to_path_buf()));
-
-        if let Some(registry) = registry.clone() {
-            let mut map = HashMap::new();
-            map.insert(registry, table);
-            (
-                "registries".into(),
-                CV::Table(map, Definition::Path(file.path().to_path_buf())),
-            )
-        } else {
-            ("registry".into(), table)
-        }
     };
 
     let mut contents = String::new();
@@ -1599,19 +1753,61 @@ pub fn save_credentials(cfg: &Config, token: String, registry: Option<String>) -
             .insert("registry".into(), map.into());
     }
 
-    if registry.is_some() {
-        if let Some(table) = toml.as_table_mut().unwrap().remove("registries") {
-            let v = CV::from_toml(Definition::Path(file.path().to_path_buf()), table)?;
-            value.merge(v, false)?;
+    if let Some(token) = token {
+        // login
+        let (key, mut value) = {
+            let key = "token".to_string();
+            let value = ConfigValue::String(token, Definition::Path(file.path().to_path_buf()));
+            let mut map = HashMap::new();
+            map.insert(key, value);
+            let table = CV::Table(map, Definition::Path(file.path().to_path_buf()));
+
+            if let Some(registry) = registry {
+                let mut map = HashMap::new();
+                map.insert(registry.to_string(), table);
+                (
+                    "registries".into(),
+                    CV::Table(map, Definition::Path(file.path().to_path_buf())),
+                )
+            } else {
+                ("registry".into(), table)
+            }
+        };
+
+        if registry.is_some() {
+            if let Some(table) = toml.as_table_mut().unwrap().remove("registries") {
+                let v = CV::from_toml(Definition::Path(file.path().to_path_buf()), table)?;
+                value.merge(v, false)?;
+            }
+        }
+        toml.as_table_mut().unwrap().insert(key, value.into_toml());
+    } else {
+        // logout
+        let table = toml.as_table_mut().unwrap();
+        if let Some(registry) = registry {
+            if let Some(registries) = table.get_mut("registries") {
+                if let Some(reg) = registries.get_mut(registry) {
+                    let rtable = reg.as_table_mut().ok_or_else(|| {
+                        format_err!("expected `[registries.{}]` to be a table", registry)
+                    })?;
+                    rtable.remove("token");
+                }
+            }
+        } else if let Some(registry) = table.get_mut("registry") {
+            let reg_table = registry
+                .as_table_mut()
+                .ok_or_else(|| format_err!("expected `[registry]` to be a table"))?;
+            reg_table.remove("token");
         }
     }
-    toml.as_table_mut().unwrap().insert(key, value.into_toml());
 
     let contents = toml.to_string();
     file.seek(SeekFrom::Start(0))?;
-    file.write_all(contents.as_bytes())?;
+    file.write_all(contents.as_bytes())
+        .chain_err(|| format!("failed to write to `{}`", file.path().display()))?;
     file.file().set_len(contents.len() as u64)?;
-    set_permissions(file.file(), 0o600)?;
+    set_permissions(file.file(), 0o600)
+        .chain_err(|| format!("failed to set permissions of `{}`", file.path().display()))?;
 
     return Ok(());
 
@@ -1643,15 +1839,6 @@ impl Drop for PackageCacheLock<'_> {
             *slot = None;
         }
     }
-}
-
-/// returns path to clippy-driver binary
-///
-/// Allows override of the path via `CARGO_CLIPPY_DRIVER` env variable
-pub fn clippy_driver() -> PathBuf {
-    env::var("CARGO_CLIPPY_DRIVER")
-        .unwrap_or_else(|_| "clippy-driver".into())
-        .into()
 }
 
 #[derive(Debug, Default, Deserialize, PartialEq)]
@@ -1714,10 +1901,147 @@ pub struct CargoBuildConfig {
     pub rustflags: Option<StringList>,
     pub rustdocflags: Option<StringList>,
     pub rustc_wrapper: Option<PathBuf>,
+    pub rustc_workspace_wrapper: Option<PathBuf>,
     pub rustc: Option<PathBuf>,
     pub rustdoc: Option<PathBuf>,
     pub out_dir: Option<ConfigRelativePath>,
 }
+
+#[derive(Deserialize, Default)]
+struct TermConfig {
+    verbose: Option<bool>,
+    color: Option<String>,
+    #[serde(default)]
+    #[serde(deserialize_with = "progress_or_string")]
+    progress: Option<ProgressConfig>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ProgressConfig {
+    pub when: ProgressWhen,
+    pub width: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProgressWhen {
+    Auto,
+    Never,
+    Always,
+}
+
+impl Default for ProgressWhen {
+    fn default() -> ProgressWhen {
+        ProgressWhen::Auto
+    }
+}
+
+fn progress_or_string<'de, D>(deserializer: D) -> Result<Option<ProgressConfig>, D::Error>
+where
+    D: serde::de::Deserializer<'de>,
+{
+    struct ProgressVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for ProgressVisitor {
+        type Value = Option<ProgressConfig>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a string (\"auto\" or \"never\") or a table")
+        }
+
+        fn visit_str<E>(self, s: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            match s {
+                "auto" => Ok(Some(ProgressConfig {
+                    when: ProgressWhen::Auto,
+                    width: None,
+                })),
+                "never" => Ok(Some(ProgressConfig {
+                    when: ProgressWhen::Never,
+                    width: None,
+                })),
+                "always" => Err(E::custom("\"always\" progress requires a `width` key")),
+                _ => Err(E::unknown_variant(s, &["auto", "never"])),
+            }
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: serde::de::Deserializer<'de>,
+        {
+            let pc = ProgressConfig::deserialize(deserializer)?;
+            if let ProgressConfig {
+                when: ProgressWhen::Always,
+                width: None,
+            } = pc
+            {
+                return Err(serde::de::Error::custom(
+                    "\"always\" progress requires a `width` key",
+                ));
+            }
+            Ok(Some(pc))
+        }
+    }
+
+    deserializer.deserialize_option(ProgressVisitor)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum EnvConfigValueInner {
+    Simple(String),
+    WithOptions {
+        value: String,
+        #[serde(default)]
+        force: bool,
+        #[serde(default)]
+        relative: bool,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(transparent)]
+pub struct EnvConfigValue {
+    inner: Value<EnvConfigValueInner>,
+}
+
+impl EnvConfigValue {
+    pub fn is_force(&self) -> bool {
+        match self.inner.val {
+            EnvConfigValueInner::Simple(_) => false,
+            EnvConfigValueInner::WithOptions { force, .. } => force,
+        }
+    }
+
+    pub fn resolve<'a>(&'a self, config: &Config) -> Cow<'a, OsStr> {
+        match self.inner.val {
+            EnvConfigValueInner::Simple(ref s) => Cow::Borrowed(OsStr::new(s.as_str())),
+            EnvConfigValueInner::WithOptions {
+                ref value,
+                relative,
+                ..
+            } => {
+                if relative {
+                    let p = self.inner.definition.root(config).join(&value);
+                    Cow::Owned(p.into_os_string())
+                } else {
+                    Cow::Borrowed(OsStr::new(value.as_str()))
+                }
+            }
+        }
+    }
+}
+
+pub type EnvConfig = HashMap<String, EnvConfigValue>;
 
 /// A type to deserialize a list of strings from a toml file.
 ///
@@ -1729,11 +2053,61 @@ pub struct CargoBuildConfig {
 /// a = 'a b c'
 /// b = ['a', 'b', 'c']
 /// ```
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct StringList(Vec<String>);
 
 impl StringList {
     pub fn as_slice(&self) -> &[String] {
         &self.0
     }
+}
+
+/// StringList automatically merges config values with environment values,
+/// this instead follows the precedence rules, so that eg. a string list found
+/// in the environment will be used instead of one in a config file.
+///
+/// This is currently only used by `PathAndArgs`
+#[derive(Debug, Deserialize)]
+pub struct UnmergedStringList(Vec<String>);
+
+#[macro_export]
+macro_rules! __shell_print {
+    ($config:expr, $which:ident, $newline:literal, $($arg:tt)*) => ({
+        let mut shell = $config.shell();
+        let out = shell.$which();
+        drop(out.write_fmt(format_args!($($arg)*)));
+        if $newline {
+            drop(out.write_all(b"\n"));
+        }
+    });
+}
+
+#[macro_export]
+macro_rules! drop_println {
+    ($config:expr) => ( $crate::drop_print!($config, "\n") );
+    ($config:expr, $($arg:tt)*) => (
+        $crate::__shell_print!($config, out, true, $($arg)*)
+    );
+}
+
+#[macro_export]
+macro_rules! drop_eprintln {
+    ($config:expr) => ( $crate::drop_eprint!($config, "\n") );
+    ($config:expr, $($arg:tt)*) => (
+        $crate::__shell_print!($config, err, true, $($arg)*)
+    );
+}
+
+#[macro_export]
+macro_rules! drop_print {
+    ($config:expr, $($arg:tt)*) => (
+        $crate::__shell_print!($config, out, false, $($arg)*)
+    );
+}
+
+#[macro_export]
+macro_rules! drop_eprint {
+    ($config:expr, $($arg:tt)*) => (
+        $crate::__shell_print!($config, err, false, $($arg)*)
+    );
 }

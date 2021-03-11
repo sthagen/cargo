@@ -4,7 +4,7 @@ use std::fs;
 
 use cargo_test_support::paths::CargoPathExt;
 use cargo_test_support::project;
-use cargo_test_support::registry::{self, api_path, registry_url};
+use cargo_test_support::registry::{self, api_path};
 
 fn setup(name: &str, content: Option<&str>) {
     let dir = api_path().join(format!("api/v1/crates/{}", name));
@@ -23,6 +23,10 @@ fn simple_list() {
                 "id": 70,
                 "login": "github:rust-lang:core",
                 "name": "Core"
+            },
+            {
+                "id": 123,
+                "login": "octocat"
             }
         ]
     }"#;
@@ -32,19 +36,24 @@ fn simple_list() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "foo"
-            version = "0.0.1"
-            authors = []
-            license = "MIT"
-            description = "foo"
-        "#,
+                [project]
+                name = "foo"
+                version = "0.0.1"
+                authors = []
+                license = "MIT"
+                description = "foo"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
 
-    p.cargo("owner -l --index")
-        .arg(registry_url().to_string())
+    p.cargo("owner -l --token sekrit")
+        .with_stdout(
+            "\
+github:rust-lang:core (Core)
+octocat
+",
+        )
         .run();
 }
 
@@ -57,23 +66,25 @@ fn simple_add() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "foo"
-            version = "0.0.1"
-            authors = []
-            license = "MIT"
-            description = "foo"
-        "#,
+                [project]
+                name = "foo"
+                version = "0.0.1"
+                authors = []
+                license = "MIT"
+                description = "foo"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
 
-    p.cargo("owner -a username --index")
-        .arg(registry_url().to_string())
+    p.cargo("owner -a username --token sekrit")
         .with_status(101)
         .with_stderr(
             "    Updating `[..]` index
-error: failed to invite owners to crate foo: EOF while parsing a value at line 1 column 0",
+error: failed to invite owners to crate `foo` on registry at file://[..]
+
+Caused by:
+  EOF while parsing a value at line 1 column 0",
         )
         .run();
 }
@@ -87,24 +98,23 @@ fn simple_remove() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "foo"
-            version = "0.0.1"
-            authors = []
-            license = "MIT"
-            description = "foo"
-        "#,
+                [project]
+                name = "foo"
+                version = "0.0.1"
+                authors = []
+                license = "MIT"
+                description = "foo"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
 
-    p.cargo("owner -r username --index")
-        .arg(registry_url().to_string())
+    p.cargo("owner -r username --token sekrit")
         .with_status(101)
         .with_stderr(
             "    Updating `[..]` index
        Owner removing [\"username\"] from crate foo
-error: failed to remove owners from crate foo
+error: failed to remove owners from crate `foo` on registry at file://[..]
 
 Caused by:
   EOF while parsing a value at line 1 column 0",

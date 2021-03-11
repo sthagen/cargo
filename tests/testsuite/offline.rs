@@ -270,7 +270,10 @@ fn cargo_compile_forbird_git_httpsrepo_offline() {
         .build();
 
     p.cargo("build --offline").with_status(101).with_stderr("\
-error: failed to load source for a dependency on `dep1`
+[ERROR] failed to get `dep1` as a dependency of package `foo v0.5.0 [..]`
+
+Caused by:
+  failed to load source for dependency `dep1`
 
 Caused by:
   Unable to update https://github.com/some_user/dep1.git
@@ -319,7 +322,7 @@ fn compile_offline_while_transitive_dep_not_cached() {
         .with_status(101)
         .with_stderr(
             "\
-[ERROR] failed to download `baz v1.0.0`
+[ERROR] failed to download `bar v0.1.0`
 
 Caused by:
   can't make HTTP request in the offline mode
@@ -516,15 +519,15 @@ fn offline_resolve_optional_fail() {
 
             [dependencies]
             dep = { version = "2.0", optional = true }
-            "#,
+        "#,
     );
 
     p.cargo("build --offline")
         .with_status(101)
         .with_stderr("\
 [ERROR] failed to select a version for the requirement `dep = \"^2.0\"`
-  candidate versions found which didn't match: 1.0.0
-  location searched: `[..]` index (which is replacing registry `https://github.com/rust-lang/crates.io-index`)
+candidate versions found which didn't match: 1.0.0
+location searched: `[..]` index (which is replacing registry `https://github.com/rust-lang/crates.io-index`)
 required by package `foo v0.1.0 ([..]/foo)`
 perhaps a crate was updated and forgotten to be re-vendored?
 As a reminder, you're using offline mode (--offline) which can sometimes cause \

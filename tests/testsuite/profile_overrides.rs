@@ -9,20 +9,20 @@ fn profile_override_basic() {
         .file(
             "Cargo.toml",
             r#"
-            [package]
-            name = "foo"
-            version = "0.0.1"
-            authors = []
+                [package]
+                name = "foo"
+                version = "0.0.1"
+                authors = []
 
-            [dependencies]
-            bar = {path = "bar"}
+                [dependencies]
+                bar = {path = "bar"}
 
-            [profile.dev]
-            opt-level = 1
+                [profile.dev]
+                opt-level = 1
 
-            [profile.dev.package.bar]
-            opt-level = 3
-        "#,
+                [profile.dev.package.bar]
+                opt-level = 3
+            "#,
         )
         .file("src/lib.rs", "")
         .file("bar/Cargo.toml", &basic_lib_manifest("bar"))
@@ -46,22 +46,22 @@ fn profile_override_warnings() {
         .file(
             "Cargo.toml",
             r#"
-            [package]
-            name = "foo"
-            version = "0.0.1"
+                [package]
+                name = "foo"
+                version = "0.0.1"
 
-            [dependencies]
-            bar = {path = "bar"}
+                [dependencies]
+                bar = {path = "bar"}
 
-            [profile.dev.package.bart]
-            opt-level = 3
+                [profile.dev.package.bart]
+                opt-level = 3
 
-            [profile.dev.package.no-suggestion]
-            opt-level = 3
+                [profile.dev.package.no-suggestion]
+                opt-level = 3
 
-            [profile.dev.package."bar:1.2.3"]
-            opt-level = 3
-        "#,
+                [profile.dev.package."bar:1.2.3"]
+                opt-level = 3
+            "#,
         )
         .file("src/lib.rs", "")
         .file("bar/Cargo.toml", &basic_lib_manifest("bar"))
@@ -107,16 +107,16 @@ fn profile_override_bad_settings() {
                 "Cargo.toml",
                 &format!(
                     r#"
-                [package]
-                name = "foo"
-                version = "0.0.1"
+                        [package]
+                        name = "foo"
+                        version = "0.0.1"
 
-                [dependencies]
-                bar = {{path = "bar"}}
+                        [dependencies]
+                        bar = {{path = "bar"}}
 
-                [profile.dev.package.bar]
-                {}
-            "#,
+                        [profile.dev.package.bar]
+                        {}
+                    "#,
                     snippet
                 ),
             )
@@ -215,17 +215,17 @@ fn profile_override_hierarchy() {
     p.cargo("build -v").with_stderr_unordered("\
 [COMPILING] m3 [..]
 [COMPILING] dep [..]
-[RUNNING] `rustc --crate-name m3 m3/src/lib.rs [..] --crate-type lib --emit=[..]link -C codegen-units=4 [..]
-[RUNNING] `rustc --crate-name dep [..]dep/src/lib.rs [..] --crate-type lib --emit=[..]link -C codegen-units=3 [..]
-[RUNNING] `rustc --crate-name m3 m3/src/lib.rs [..] --crate-type lib --emit=[..]link -C codegen-units=1 [..]
-[RUNNING] `rustc --crate-name build_script_build m1/build.rs [..] --crate-type bin --emit=[..]link -C codegen-units=4 [..]
+[RUNNING] `rustc --crate-name m3 m3/src/lib.rs [..] --crate-type lib --emit=[..]link[..]-C codegen-units=4 [..]
+[RUNNING] `rustc --crate-name dep [..]dep/src/lib.rs [..] --crate-type lib --emit=[..]link[..]-C codegen-units=3 [..]
+[RUNNING] `rustc --crate-name m3 m3/src/lib.rs [..] --crate-type lib --emit=[..]link[..]-C codegen-units=1 [..]
+[RUNNING] `rustc --crate-name build_script_build m1/build.rs [..] --crate-type bin --emit=[..]link[..]-C codegen-units=4 [..]
 [COMPILING] m2 [..]
-[RUNNING] `rustc --crate-name build_script_build m2/build.rs [..] --crate-type bin --emit=[..]link -C codegen-units=2 [..]
+[RUNNING] `rustc --crate-name build_script_build m2/build.rs [..] --crate-type bin --emit=[..]link[..]-C codegen-units=2 [..]
 [RUNNING] `[..]/m1-[..]/build-script-build`
 [RUNNING] `[..]/m2-[..]/build-script-build`
-[RUNNING] `rustc --crate-name m2 m2/src/lib.rs [..] --crate-type lib --emit=[..]link -C codegen-units=2 [..]
+[RUNNING] `rustc --crate-name m2 m2/src/lib.rs [..] --crate-type lib --emit=[..]link[..]-C codegen-units=2 [..]
 [COMPILING] m1 [..]
-[RUNNING] `rustc --crate-name m1 m1/src/lib.rs [..] --crate-type lib --emit=[..]link -C codegen-units=1 [..]
+[RUNNING] `rustc --crate-name m1 m1/src/lib.rs [..] --crate-type lib --emit=[..]link[..]-C codegen-units=1 [..]
 [FINISHED] dev [unoptimized + debuginfo] [..]
 ",
         )

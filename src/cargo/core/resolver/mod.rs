@@ -47,7 +47,7 @@
 //! that we're implementing something that probably shouldn't be allocating all
 //! over the place.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::mem;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -69,9 +69,9 @@ use self::types::{FeaturesSet, RcVecIter, RemainingDeps, ResolverProgress};
 pub use self::encode::Metadata;
 pub use self::encode::{EncodableDependency, EncodablePackageId, EncodableResolve};
 pub use self::errors::{ActivateError, ActivateResult, ResolveError};
-pub use self::features::HasDevUnits;
+pub use self::features::{ForceAllTargets, HasDevUnits};
 pub use self::resolve::{Resolve, ResolveVersion};
-pub use self::types::ResolveOpts;
+pub use self::types::{ResolveBehavior, ResolveOpts};
 
 mod conflict_cache;
 mod context;
@@ -160,7 +160,7 @@ pub fn resolve(
         cksums,
         BTreeMap::new(),
         Vec::new(),
-        ResolveVersion::default_for_new_lockfiles(),
+        ResolveVersion::default(),
         summaries,
     );
 
@@ -609,12 +609,11 @@ fn activate(
     cx.age += 1;
     if let Some((parent, dep)) = parent {
         let parent_pid = parent.package_id();
-        Rc::make_mut(
-            // add a edge from candidate to parent in the parents graph
-            cx.parents.link(candidate_pid, parent_pid),
-        )
-        // and associate dep with that edge
-        .push(dep.clone());
+        // add a edge from candidate to parent in the parents graph
+        cx.parents
+            .link(candidate_pid, parent_pid)
+            // and associate dep with that edge
+            .insert(dep.clone());
         if let Some(public_dependency) = cx.public_dependency.as_mut() {
             public_dependency.add_edge(
                 candidate_pid,
@@ -656,7 +655,7 @@ fn activate(
 
     let now = Instant::now();
     let (used_features, deps) =
-        &*registry.build_deps(parent.map(|p| p.0.package_id()), &candidate, &opts)?;
+        &*registry.build_deps(cx, parent.map(|p| p.0.package_id()), &candidate, &opts)?;
 
     // Record what list of features is active for this package.
     if !used_features.is_empty() {
@@ -845,7 +844,7 @@ fn generalize_conflicting(
     for (critical_parent, critical_parents_deps) in
         cx.parents.edges(&backtrack_critical_id).filter(|(p, _)| {
             // it will only help backjump further if it is older then the critical_age
-            cx.is_active(*p).expect("parent not currently active!?") < backtrack_critical_age
+            cx.is_active(**p).expect("parent not currently active!?") < backtrack_critical_age
         })
     {
         for critical_parents_dep in critical_parents_deps.iter() {
@@ -1001,28 +1000,46 @@ fn find_candidate(
 }
 
 fn check_cycles(resolve: &Resolve) -> CargoResult<()> {
-    // Sort packages to produce user friendly deterministic errors.
-    let mut all_packages: Vec<_> = resolve.iter().collect();
-    all_packages.sort_unstable();
+    // Create a simple graph representation alternative of `resolve` which has
+    // only the edges we care about. Note that `BTree*` is used to produce
+    // deterministic error messages here. Also note that the main reason for
+    // this copy of the resolve graph is to avoid edges between a crate and its
+    // dev-dependency since that doesn't count for cycles.
+    let mut graph = BTreeMap::new();
+    for id in resolve.iter() {
+        let set = graph.entry(id).or_insert_with(BTreeSet::new);
+        for (dep, listings) in resolve.deps_not_replaced(id) {
+            let is_transitive = listings.iter().any(|d| d.is_transitive());
+
+            if is_transitive {
+                set.insert(dep);
+                set.extend(resolve.replacement(dep));
+            }
+        }
+    }
+
+    // After we have the `graph` that we care about, perform a simple cycle
+    // check by visiting all nodes. We visit each node at most once and we keep
+    // track of the path through the graph as we walk it. If we walk onto the
+    // same node twice that's a cycle.
     let mut checked = HashSet::new();
     let mut path = Vec::new();
     let mut visited = HashSet::new();
-    for pkg in all_packages {
-        if !checked.contains(&pkg) {
-            visit(resolve, pkg, &mut visited, &mut path, &mut checked)?
+    for pkg in graph.keys() {
+        if !checked.contains(pkg) {
+            visit(&graph, *pkg, &mut visited, &mut path, &mut checked)?
         }
     }
     return Ok(());
 
     fn visit(
-        resolve: &Resolve,
+        graph: &BTreeMap<PackageId, BTreeSet<PackageId>>,
         id: PackageId,
         visited: &mut HashSet<PackageId>,
         path: &mut Vec<PackageId>,
         checked: &mut HashSet<PackageId>,
     ) -> CargoResult<()> {
         path.push(id);
-        // See if we visited ourselves
         if !visited.insert(id) {
             anyhow::bail!(
                 "cyclic package dependency: package `{}` depends on itself. Cycle:\n{}",
@@ -1031,32 +1048,12 @@ fn check_cycles(resolve: &Resolve) -> CargoResult<()> {
             );
         }
 
-        // If we've already checked this node no need to recurse again as we'll
-        // just conclude the same thing as last time, so we only execute the
-        // recursive step if we successfully insert into `checked`.
-        //
-        // Note that if we hit an intransitive dependency then we clear out the
-        // visitation list as we can't induce a cycle through transitive
-        // dependencies.
         if checked.insert(id) {
-            let mut empty_set = HashSet::new();
-            let mut empty_vec = Vec::new();
-            for (dep, listings) in resolve.deps_not_replaced(id) {
-                let is_transitive = listings.iter().any(|d| d.is_transitive());
-                let (visited, path) = if is_transitive {
-                    (&mut *visited, &mut *path)
-                } else {
-                    (&mut empty_set, &mut empty_vec)
-                };
-                visit(resolve, dep, visited, path, checked)?;
-
-                if let Some(id) = resolve.replacement(dep) {
-                    visit(resolve, id, visited, path, checked)?;
-                }
+            for dep in graph[&id].iter() {
+                visit(graph, *dep, visited, path, checked)?;
             }
         }
 
-        // Ok, we're done, no longer visiting our node any more
         path.pop();
         visited.remove(&id);
         Ok(())
@@ -1072,7 +1069,7 @@ fn check_duplicate_pkgs_in_lockfile(resolve: &Resolve) -> CargoResult<()> {
     let mut unique_pkg_ids = HashMap::new();
     let state = encode::EncodeState::new(resolve);
     for pkg_id in resolve.iter() {
-        let encodable_pkd_id = encode::encodable_package_id(pkg_id, &state);
+        let encodable_pkd_id = encode::encodable_package_id(pkg_id, &state, resolve.version());
         if let Some(prev_pkg_id) = unique_pkg_ids.insert(encodable_pkd_id, pkg_id) {
             anyhow::bail!(
                 "package collision in the lockfile: packages {} and {} are different, \

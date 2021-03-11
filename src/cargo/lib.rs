@@ -18,8 +18,8 @@
 #![allow(clippy::wrong_self_convention)] // perhaps `Rc` should be special-cased in Clippy?
 #![allow(clippy::write_with_newline)] // too pedantic
 #![allow(clippy::inefficient_to_string)] // this causes suggestions that result in `(*s).to_string()`
+#![allow(clippy::collapsible_if)] // too pedantic
 #![warn(clippy::needless_borrow)]
-#![warn(clippy::redundant_clone)]
 // Unit is now interned, and would probably be better as pass-by-copy, but
 // doing so causes a lot of & and * shenanigans that makes the code arguably
 // less clear and harder to read.
@@ -28,17 +28,16 @@
 #![allow(clippy::unneeded_field_pattern)]
 // false positives in target-specific code, for details see
 // https://github.com/rust-lang/cargo/pull/7251#pullrequestreview-274914270
-#![allow(clippy::identity_conversion)]
+#![allow(clippy::useless_conversion)]
 
 use crate::core::shell::Verbosity::Verbose;
 use crate::core::Shell;
 use anyhow::Error;
 use log::debug;
-use serde::ser;
 use std::fmt;
 
 pub use crate::util::errors::{InternalError, VerboseError};
-pub use crate::util::{CargoResult, CliError, CliResult, Config};
+pub use crate::util::{indented_lines, CargoResult, CliError, CliResult, Config};
 
 pub const CARGO_ENV: &str = "CARGO";
 
@@ -93,11 +92,6 @@ impl fmt::Display for VersionInfo {
     }
 }
 
-pub fn print_json<T: ser::Serialize>(obj: &T) {
-    let encoded = serde_json::to_string(&obj).unwrap();
-    println!("{}", encoded);
-}
-
 pub fn exit_with_error(err: CliError, shell: &mut Shell) -> ! {
     debug!("exit_with_error; err={:?}", err);
     if let Some(ref err) = err.error {
@@ -117,7 +111,7 @@ pub fn exit_with_error(err: CliError, shell: &mut Shell) -> ! {
 /// Displays an error, and all its causes, to stderr.
 pub fn display_error(err: &Error, shell: &mut Shell) {
     debug!("display_error; err={:?}", err);
-    let has_verbose = _display_error(err, shell);
+    let has_verbose = _display_error(err, shell, true);
     if has_verbose {
         drop(writeln!(
             shell.err(),
@@ -140,7 +134,15 @@ pub fn display_error(err: &Error, shell: &mut Shell) {
     }
 }
 
-fn _display_error(err: &Error, shell: &mut Shell) -> bool {
+/// Displays a warning, with an error object providing detailed information
+/// and context.
+pub fn display_warning_with_error(warning: &str, err: &Error, shell: &mut Shell) {
+    drop(shell.warn(warning));
+    drop(writeln!(shell.err()));
+    _display_error(err, shell, false);
+}
+
+fn _display_error(err: &Error, shell: &mut Shell, as_err: bool) -> bool {
     let verbosity = shell.verbosity();
     let is_verbose = |e: &(dyn std::error::Error + 'static)| -> bool {
         verbosity != Verbose && e.downcast_ref::<VerboseError>().is_some()
@@ -149,7 +151,11 @@ fn _display_error(err: &Error, shell: &mut Shell) -> bool {
     if is_verbose(err.as_ref()) {
         return true;
     }
-    drop(shell.error(&err));
+    if as_err {
+        drop(shell.error(&err));
+    } else {
+        drop(writeln!(shell.err(), "{}", err));
+    }
     for cause in err.chain().skip(1) {
         // If we're not in verbose mode then print remaining errors until one
         // marked as `VerboseError` appears.
@@ -157,7 +163,11 @@ fn _display_error(err: &Error, shell: &mut Shell) -> bool {
             return true;
         }
         drop(writeln!(shell.err(), "\nCaused by:"));
-        drop(writeln!(shell.err(), "  {}", cause));
+        drop(write!(
+            shell.err(),
+            "{}",
+            indented_lines(&cause.to_string())
+        ));
     }
     false
 }

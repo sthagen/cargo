@@ -1,9 +1,10 @@
 use super::job::{Freshness, Job, Work};
-use super::{fingerprint, Context, Unit};
+use super::{fingerprint, Context, LinkType, Unit};
 use crate::core::compiler::context::Metadata;
 use crate::core::compiler::job_queue::JobState;
 use crate::core::{profiles::ProfileRoot, PackageId};
 use crate::util::errors::{CargoResult, CargoResultExt};
+use crate::util::interning::InternedString;
 use crate::util::machine_message::{self, Message};
 use crate::util::{self, internal, paths, profile};
 use cargo_platform::Cfg;
@@ -11,7 +12,9 @@ use std::collections::hash_map::{Entry, HashMap};
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::str;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+const CARGO_WARNING: &str = "cargo:warning=";
 
 /// Contains the parsed output of a custom build script.
 #[derive(Clone, Debug, Hash, Default)]
@@ -21,7 +24,7 @@ pub struct BuildOutput {
     /// Names and link kinds of libraries, suitable for the `-l` flag.
     pub library_links: Vec<String>,
     /// Linker arguments suitable to be passed to `-C link-arg=<args>`
-    pub linker_args: Vec<String>,
+    pub linker_args: Vec<(Option<LinkType>, String)>,
     /// Various `--cfg` flags to pass to the compiler.
     pub cfgs: Vec<String>,
     /// Additional environment variables to run the compiler with.
@@ -49,7 +52,7 @@ pub struct BuildOutput {
 /// `Unit` because this structure needs to be shareable between threads.
 #[derive(Default)]
 pub struct BuildScriptOutputs {
-    outputs: HashMap<(PackageId, Metadata), BuildOutput>,
+    outputs: HashMap<Metadata, BuildOutput>,
 }
 
 /// Linking information for a `Unit`.
@@ -100,7 +103,7 @@ pub struct BuildDeps {
 }
 
 /// Prepares a `Work` that executes the target as a custom build script.
-pub fn prepare<'a, 'cfg>(cx: &mut Context<'a, 'cfg>, unit: &Unit<'a>) -> CargoResult<Job> {
+pub fn prepare(cx: &mut Context<'_, '_>, unit: &Unit) -> CargoResult<Job> {
     let _p = profile::start(format!(
         "build script prepare: {}/{}",
         unit.pkg,
@@ -112,7 +115,7 @@ pub fn prepare<'a, 'cfg>(cx: &mut Context<'a, 'cfg>, unit: &Unit<'a>) -> CargoRe
         .build_script_outputs
         .lock()
         .unwrap()
-        .contains_key(unit.pkg.package_id(), metadata)
+        .contains_key(metadata)
     {
         // The output is already set, thus the build script is overridden.
         fingerprint::prepare_target(cx, unit, false)
@@ -126,7 +129,7 @@ fn emit_build_output(
     output: &BuildOutput,
     out_dir: &Path,
     package_id: PackageId,
-) {
+) -> CargoResult<()> {
     let library_paths = output
         .library_paths
         .iter()
@@ -142,10 +145,11 @@ fn emit_build_output(
         out_dir,
     }
     .to_json_string();
-    state.stdout(msg);
+    state.stdout(msg)?;
+    Ok(())
 }
 
-fn build_work<'a, 'cfg>(cx: &mut Context<'a, 'cfg>, unit: &Unit<'a>) -> CargoResult<Job> {
+fn build_work(cx: &mut Context<'_, '_>, unit: &Unit) -> CargoResult<Job> {
     assert!(unit.mode.is_run_custom_build());
     let bcx = &cx.bcx;
     let dependencies = cx.unit_deps(unit);
@@ -175,7 +179,7 @@ fn build_work<'a, 'cfg>(cx: &mut Context<'a, 'cfg>, unit: &Unit<'a>) -> CargoRes
     // `Profiles::get_profile_run_custom_build` so that those flags get
     // carried over.
     let to_exec = to_exec.into_os_string();
-    let mut cmd = cx.compilation.host_process(to_exec, unit.pkg)?;
+    let mut cmd = cx.compilation.host_process(to_exec, &unit.pkg)?;
     let debug = unit.profile.debuginfo.unwrap_or(0) != 0;
     cmd.env("OUT_DIR", &script_out_dir)
         .env("CARGO_MANIFEST_DIR", unit.pkg.root())
@@ -228,6 +232,11 @@ fn build_work<'a, 'cfg>(cx: &mut Context<'a, 'cfg>, unit: &Unit<'a>) -> CargoRes
         }
     }
     for (k, v) in cfg_map {
+        if k == "debug_assertions" {
+            // This cfg is always true and misleading, so avoid setting it.
+            // That is because Cargo queries rustc without any profile settings.
+            continue;
+        }
         let k = format!("CARGO_CFG_{}", super::envify(&k));
         match v {
             Some(list) => {
@@ -259,16 +268,18 @@ fn build_work<'a, 'cfg>(cx: &mut Context<'a, 'cfg>, unit: &Unit<'a>) -> CargoRes
             }
         })
         .collect::<Vec<_>>();
-    let pkg_name = unit.pkg.to_string();
+    let pkg_name = unit.pkg.name();
+    let pkg_descr = unit.pkg.to_string();
     let build_script_outputs = Arc::clone(&cx.build_script_outputs);
     let id = unit.pkg.package_id();
     let output_file = script_run_dir.join("output");
     let err_file = script_run_dir.join("stderr");
     let root_output_file = script_run_dir.join("root-output");
-    let host_target_root = cx.files().host_root().to_path_buf();
+    let host_target_root = cx.files().host_dest().to_path_buf();
     let all = (
         id,
-        pkg_name.clone(),
+        pkg_name,
+        pkg_descr.clone(),
         Arc::clone(&build_script_outputs),
         output_file.clone(),
         script_out_dir.clone(),
@@ -281,6 +292,9 @@ fn build_work<'a, 'cfg>(cx: &mut Context<'a, 'cfg>, unit: &Unit<'a>) -> CargoRes
 
     paths::create_dir_all(&script_dir)?;
     paths::create_dir_all(&script_out_dir)?;
+
+    let extra_link_arg = cx.bcx.config.cli_unstable().extra_link_arg;
+    let nightly_features_allowed = cx.bcx.config.nightly_features_allowed;
 
     // Prepare the unit of "dirty work" which will actually run the custom build
     // command.
@@ -302,15 +316,12 @@ fn build_work<'a, 'cfg>(cx: &mut Context<'a, 'cfg>, unit: &Unit<'a>) -> CargoRes
         if !build_plan {
             let build_script_outputs = build_script_outputs.lock().unwrap();
             for (name, dep_id, dep_metadata) in lib_deps {
-                let script_output =
-                    build_script_outputs
-                        .get(dep_id, dep_metadata)
-                        .ok_or_else(|| {
-                            internal(format!(
-                                "failed to locate build state for env vars: {}/{}",
-                                dep_id, dep_metadata
-                            ))
-                        })?;
+                let script_output = build_script_outputs.get(dep_metadata).ok_or_else(|| {
+                    internal(format!(
+                        "failed to locate build state for env vars: {}/{}",
+                        dep_id, dep_metadata
+                    ))
+                })?;
                 let data = &script_output.metadata;
                 for &(ref key, ref value) in data.iter() {
                     cmd.env(
@@ -338,23 +349,39 @@ fn build_work<'a, 'cfg>(cx: &mut Context<'a, 'cfg>, unit: &Unit<'a>) -> CargoRes
         state.running(&cmd);
         let timestamp = paths::set_invocation_time(&script_run_dir)?;
         let prefix = format!("[{} {}] ", id.name(), id.version());
+        let mut warnings_in_case_of_panic = Vec::new();
         let output = cmd
             .exec_with_streaming(
                 &mut |stdout| {
+                    if let Some(warning) = stdout.strip_prefix(CARGO_WARNING) {
+                        warnings_in_case_of_panic.push(warning.to_owned());
+                    }
                     if extra_verbose {
-                        state.stdout(format!("{}{}", prefix, stdout));
+                        state.stdout(format!("{}{}", prefix, stdout))?;
                     }
                     Ok(())
                 },
                 &mut |stderr| {
                     if extra_verbose {
-                        state.stderr(format!("{}{}", prefix, stderr));
+                        state.stderr(format!("{}{}", prefix, stderr))?;
                     }
                     Ok(())
                 },
                 true,
             )
-            .chain_err(|| format!("failed to run custom build command for `{}`", pkg_name))?;
+            .chain_err(|| format!("failed to run custom build command for `{}`", pkg_descr));
+
+        if let Err(error) = output {
+            insert_warnings_in_build_outputs(
+                build_script_outputs,
+                id,
+                metadata_hash,
+                warnings_in_case_of_panic,
+            );
+            return Err(error);
+        }
+
+        let output = output.unwrap();
 
         // After the build command has finished running, we need to be sure to
         // remember all of its output so we can later discover precisely what it
@@ -364,14 +391,23 @@ fn build_work<'a, 'cfg>(cx: &mut Context<'a, 'cfg>, unit: &Unit<'a>) -> CargoRes
         // state informing what variables were discovered via our script as
         // well.
         paths::write(&output_file, &output.stdout)?;
-        filetime::set_file_times(output_file, timestamp, timestamp)?;
+        // This mtime shift allows Cargo to detect if a source file was
+        // modified in the middle of the build.
+        paths::set_file_time_no_err(output_file, timestamp);
         paths::write(&err_file, &output.stderr)?;
         paths::write(&root_output_file, util::path2bytes(&script_out_dir)?)?;
-        let parsed_output =
-            BuildOutput::parse(&output.stdout, &pkg_name, &script_out_dir, &script_out_dir)?;
+        let parsed_output = BuildOutput::parse(
+            &output.stdout,
+            pkg_name,
+            &pkg_descr,
+            &script_out_dir,
+            &script_out_dir,
+            extra_link_arg,
+            nightly_features_allowed,
+        )?;
 
         if json_messages {
-            emit_build_output(state, &parsed_output, script_out_dir.as_path(), id);
+            emit_build_output(state, &parsed_output, script_out_dir.as_path(), id)?;
         }
         build_script_outputs
             .lock()
@@ -384,19 +420,22 @@ fn build_work<'a, 'cfg>(cx: &mut Context<'a, 'cfg>, unit: &Unit<'a>) -> CargoRes
     // itself to run when we actually end up just discarding what we calculated
     // above.
     let fresh = Work::new(move |state| {
-        let (id, pkg_name, build_script_outputs, output_file, script_out_dir) = all;
+        let (id, pkg_name, pkg_descr, build_script_outputs, output_file, script_out_dir) = all;
         let output = match prev_output {
             Some(output) => output,
             None => BuildOutput::parse_file(
                 &output_file,
-                &pkg_name,
+                pkg_name,
+                &pkg_descr,
                 &prev_script_out_dir,
                 &script_out_dir,
+                extra_link_arg,
+                nightly_features_allowed,
             )?,
         };
 
         if json_messages {
-            emit_build_output(state, &output, script_out_dir.as_path(), id);
+            emit_build_output(state, &output, script_out_dir.as_path(), id)?;
         }
 
         build_script_outputs
@@ -407,7 +446,7 @@ fn build_work<'a, 'cfg>(cx: &mut Context<'a, 'cfg>, unit: &Unit<'a>) -> CargoRes
     });
 
     let mut job = if cx.bcx.build_config.build_plan {
-        Job::new(Work::noop(), Freshness::Dirty)
+        Job::new_dirty(Work::noop())
     } else {
         fingerprint::prepare_target(cx, unit, false)?
     };
@@ -419,19 +458,41 @@ fn build_work<'a, 'cfg>(cx: &mut Context<'a, 'cfg>, unit: &Unit<'a>) -> CargoRes
     Ok(job)
 }
 
+fn insert_warnings_in_build_outputs(
+    build_script_outputs: Arc<Mutex<BuildScriptOutputs>>,
+    id: PackageId,
+    metadata_hash: Metadata,
+    warnings: Vec<String>,
+) {
+    let build_output_with_only_warnings = BuildOutput {
+        warnings,
+        ..BuildOutput::default()
+    };
+    build_script_outputs
+        .lock()
+        .unwrap()
+        .insert(id, metadata_hash, build_output_with_only_warnings);
+}
+
 impl BuildOutput {
     pub fn parse_file(
         path: &Path,
-        pkg_name: &str,
+        pkg_name: InternedString,
+        pkg_descr: &str,
         script_out_dir_when_generated: &Path,
         script_out_dir: &Path,
+        extra_link_arg: bool,
+        nightly_features_allowed: bool,
     ) -> CargoResult<BuildOutput> {
         let contents = paths::read_bytes(path)?;
         BuildOutput::parse(
             &contents,
             pkg_name,
+            pkg_descr,
             script_out_dir_when_generated,
             script_out_dir,
+            extra_link_arg,
+            nightly_features_allowed,
         )
     }
 
@@ -439,9 +500,12 @@ impl BuildOutput {
     // The `pkg_name` is used for error messages.
     pub fn parse(
         input: &[u8],
-        pkg_name: &str,
+        pkg_name: InternedString,
+        pkg_descr: &str,
         script_out_dir_when_generated: &Path,
         script_out_dir: &Path,
+        extra_link_arg: bool,
+        nightly_features_allowed: bool,
     ) -> CargoResult<BuildOutput> {
         let mut library_paths = Vec::new();
         let mut library_links = Vec::new();
@@ -452,7 +516,7 @@ impl BuildOutput {
         let mut rerun_if_changed = Vec::new();
         let mut rerun_if_env_changed = Vec::new();
         let mut warnings = Vec::new();
-        let whence = format!("build script of `{}`", pkg_name);
+        let whence = format!("build script of `{}`", pkg_descr);
 
         for line in input.split(|b| *b == b'\n') {
             let line = match str::from_utf8(line) {
@@ -494,9 +558,55 @@ impl BuildOutput {
                 }
                 "rustc-link-lib" => library_links.push(value.to_string()),
                 "rustc-link-search" => library_paths.push(PathBuf::from(value)),
-                "rustc-cdylib-link-arg" => linker_args.push(value.to_string()),
+                "rustc-link-arg-cdylib" | "rustc-cdylib-link-arg" => {
+                    linker_args.push((Some(LinkType::Cdylib), value))
+                }
+                "rustc-link-arg-bins" => {
+                    if extra_link_arg {
+                        linker_args.push((Some(LinkType::Bin), value));
+                    } else {
+                        warnings.push(format!("cargo:{} requires -Zextra-link-arg flag", key));
+                    }
+                }
+                "rustc-link-arg" => {
+                    if extra_link_arg {
+                        linker_args.push((None, value));
+                    } else {
+                        warnings.push(format!("cargo:{} requires -Zextra-link-arg flag", key));
+                    }
+                }
                 "rustc-cfg" => cfgs.push(value.to_string()),
-                "rustc-env" => env.push(BuildOutput::parse_rustc_env(&value, &whence)?),
+                "rustc-env" => {
+                    let (key, val) = BuildOutput::parse_rustc_env(&value, &whence)?;
+                    // Build scripts aren't allowed to set RUSTC_BOOTSTRAP.
+                    // See https://github.com/rust-lang/cargo/issues/7088.
+                    if key == "RUSTC_BOOTSTRAP" {
+                        // If RUSTC_BOOTSTRAP is already set, the user of Cargo knows about
+                        // bootstrap and still wants to override the channel. Give them a way to do
+                        // so, but still emit a warning that the current crate shouldn't be trying
+                        // to set RUSTC_BOOTSTRAP.
+                        // If this is a nightly build, setting RUSTC_BOOTSTRAP wouldn't affect the
+                        // behavior, so still only give a warning.
+                        if nightly_features_allowed {
+                            warnings.push(format!("Cannot set `RUSTC_BOOTSTRAP={}` from {}.\n\
+                                note: Crates cannot set `RUSTC_BOOTSTRAP` themselves, as doing so would subvert the stability guarantees of Rust for your project.",
+                                val, whence
+                            ));
+                        } else {
+                            // Setting RUSTC_BOOTSTRAP would change the behavior of the crate.
+                            // Abort with an error.
+                            anyhow::bail!("Cannot set `RUSTC_BOOTSTRAP={}` from {}.\n\
+                                note: Crates cannot set `RUSTC_BOOTSTRAP` themselves, as doing so would subvert the stability guarantees of Rust for your project.\n\
+                                help: If you're sure you want to do this in your project, set the environment variable `RUSTC_BOOTSTRAP={}` before running cargo instead.",
+                                val,
+                                whence,
+                                pkg_name,
+                            );
+                        }
+                    } else {
+                        env.push((key, val));
+                    }
+                }
                 "warning" => warnings.push(value.to_string()),
                 "rerun-if-changed" => rerun_if_changed.push(PathBuf::from(value)),
                 "rerun-if-env-changed" => rerun_if_env_changed.push(value.to_string()),
@@ -573,11 +683,7 @@ impl BuildOutput {
     }
 }
 
-fn prepare_metabuild<'a, 'cfg>(
-    cx: &Context<'a, 'cfg>,
-    unit: &Unit<'a>,
-    deps: &[String],
-) -> CargoResult<()> {
+fn prepare_metabuild(cx: &Context<'_, '_>, unit: &Unit, deps: &[String]) -> CargoResult<()> {
     let mut output = Vec::new();
     let available_deps = cx.unit_deps(unit);
     // Filter out optional dependencies, and look up the actual lib name.
@@ -637,9 +743,9 @@ impl BuildDeps {
 ///
 /// The given set of units to this function is the initial set of
 /// targets/profiles which are being built.
-pub fn build_map<'b, 'cfg>(cx: &mut Context<'b, 'cfg>, units: &[Unit<'b>]) -> CargoResult<()> {
+pub fn build_map(cx: &mut Context<'_, '_>) -> CargoResult<()> {
     let mut ret = HashMap::new();
-    for unit in units {
+    for unit in &cx.bcx.roots {
         build(&mut ret, cx, unit)?;
     }
     cx.build_scripts
@@ -648,10 +754,10 @@ pub fn build_map<'b, 'cfg>(cx: &mut Context<'b, 'cfg>, units: &[Unit<'b>]) -> Ca
 
     // Recursive function to build up the map we're constructing. This function
     // memoizes all of its return values as it goes along.
-    fn build<'a, 'b, 'cfg>(
-        out: &'a mut HashMap<Unit<'b>, BuildScripts>,
-        cx: &mut Context<'b, 'cfg>,
-        unit: &Unit<'b>,
+    fn build<'a>(
+        out: &'a mut HashMap<Unit, BuildScripts>,
+        cx: &mut Context<'_, '_>,
+        unit: &Unit,
     ) -> CargoResult<&'a BuildScripts> {
         // Do a quick pre-flight check to see if we've already calculated the
         // set of dependencies.
@@ -662,7 +768,7 @@ pub fn build_map<'b, 'cfg>(cx: &mut Context<'b, 'cfg>, units: &[Unit<'b>]) -> Ca
         // If there is a build script override, pre-fill the build output.
         if unit.mode.is_run_custom_build() {
             if let Some(links) = unit.pkg.manifest().links() {
-                if let Some(output) = cx.bcx.script_override(links, unit.kind) {
+                if let Some(output) = cx.bcx.target_data.script_override(links, unit.kind) {
                     let metadata = cx.get_run_build_script_metadata(unit);
                     cx.build_script_outputs.lock().unwrap().insert(
                         unit.pkg.package_id(),
@@ -678,21 +784,22 @@ pub fn build_map<'b, 'cfg>(cx: &mut Context<'b, 'cfg>, units: &[Unit<'b>]) -> Ca
         // If a package has a build script, add itself as something to inspect for linking.
         if !unit.target.is_custom_build() && unit.pkg.has_custom_build() {
             let script_meta = cx
-                .find_build_script_metadata(*unit)
+                .find_build_script_metadata(unit)
                 .expect("has_custom_build should have RunCustomBuild");
             add_to_link(&mut ret, unit.pkg.package_id(), script_meta);
         }
 
         // Load any dependency declarations from a previous run.
         if unit.mode.is_run_custom_build() {
-            parse_previous_explicit_deps(cx, unit)?;
+            parse_previous_explicit_deps(cx, unit);
         }
 
         // We want to invoke the compiler deterministically to be cache-friendly
         // to rustc invocation caching schemes, so be sure to generate the same
         // set of build script dependency orderings via sorting the targets that
         // come out of the `Context`.
-        let mut dependencies: Vec<Unit<'_>> = cx.unit_deps(unit).iter().map(|d| d.unit).collect();
+        let mut dependencies: Vec<Unit> =
+            cx.unit_deps(unit).iter().map(|d| d.unit.clone()).collect();
         dependencies.sort_by_key(|u| u.pkg.package_id());
 
         for dep_unit in dependencies.iter() {
@@ -700,14 +807,14 @@ pub fn build_map<'b, 'cfg>(cx: &mut Context<'b, 'cfg>, units: &[Unit<'b>]) -> Ca
 
             if dep_unit.target.for_host() {
                 ret.plugins.extend(dep_scripts.to_link.iter().cloned());
-            } else if dep_unit.target.linkable() {
+            } else if dep_unit.target.is_linkable() {
                 for &(pkg, metadata) in dep_scripts.to_link.iter() {
                     add_to_link(&mut ret, pkg, metadata);
                 }
             }
         }
 
-        match out.entry(*unit) {
+        match out.entry(unit.clone()) {
             Entry::Vacant(entry) => Ok(entry.insert(ret)),
             Entry::Occupied(_) => panic!("cyclic dependencies in `build_map`"),
         }
@@ -721,16 +828,12 @@ pub fn build_map<'b, 'cfg>(cx: &mut Context<'b, 'cfg>, units: &[Unit<'b>]) -> Ca
         }
     }
 
-    fn parse_previous_explicit_deps<'a, 'cfg>(
-        cx: &mut Context<'a, 'cfg>,
-        unit: &Unit<'a>,
-    ) -> CargoResult<()> {
+    fn parse_previous_explicit_deps(cx: &mut Context<'_, '_>, unit: &Unit) {
         let script_run_dir = cx.files().build_script_run_dir(unit);
         let output_file = script_run_dir.join("output");
         let (prev_output, _) = prev_build_output(cx, unit);
         let deps = BuildDeps::new(&output_file, prev_output.as_ref());
-        cx.build_explicit_deps.insert(*unit, deps);
-        Ok(())
+        cx.build_explicit_deps.insert(unit.clone(), deps);
     }
 }
 
@@ -739,10 +842,7 @@ pub fn build_map<'b, 'cfg>(cx: &mut Context<'b, 'cfg>, units: &[Unit<'b>]) -> Ca
 ///
 /// Also returns the directory containing the output, typically used later in
 /// processing.
-fn prev_build_output<'a, 'cfg>(
-    cx: &mut Context<'a, 'cfg>,
-    unit: &Unit<'a>,
-) -> (Option<BuildOutput>, PathBuf) {
+fn prev_build_output(cx: &mut Context<'_, '_>, unit: &Unit) -> (Option<BuildOutput>, PathBuf) {
     let script_out_dir = cx.files().build_script_out_dir(unit);
     let script_run_dir = cx.files().build_script_run_dir(unit);
     let root_output_file = script_run_dir.join("root-output");
@@ -752,12 +852,17 @@ fn prev_build_output<'a, 'cfg>(
         .and_then(|bytes| util::bytes2path(&bytes))
         .unwrap_or_else(|_| script_out_dir.clone());
 
+    let extra_link_arg = cx.bcx.config.cli_unstable().extra_link_arg;
+
     (
         BuildOutput::parse_file(
             &output_file,
+            unit.pkg.name(),
             &unit.pkg.to_string(),
             &prev_script_out_dir,
             &script_out_dir,
+            extra_link_arg,
+            cx.bcx.config.nightly_features_allowed,
         )
         .ok(),
         prev_script_out_dir,
@@ -767,7 +872,7 @@ fn prev_build_output<'a, 'cfg>(
 impl BuildScriptOutputs {
     /// Inserts a new entry into the map.
     fn insert(&mut self, pkg_id: PackageId, metadata: Metadata, parsed_output: BuildOutput) {
-        match self.outputs.entry((pkg_id, metadata)) {
+        match self.outputs.entry(metadata) {
             Entry::Vacant(entry) => {
                 entry.insert(parsed_output);
             }
@@ -783,17 +888,17 @@ impl BuildScriptOutputs {
     }
 
     /// Returns `true` if the given key already exists.
-    fn contains_key(&self, pkg_id: PackageId, metadata: Metadata) -> bool {
-        self.outputs.contains_key(&(pkg_id, metadata))
+    fn contains_key(&self, metadata: Metadata) -> bool {
+        self.outputs.contains_key(&metadata)
     }
 
     /// Gets the build output for the given key.
-    pub fn get(&self, pkg_id: PackageId, meta: Metadata) -> Option<&BuildOutput> {
-        self.outputs.get(&(pkg_id, meta))
+    pub fn get(&self, meta: Metadata) -> Option<&BuildOutput> {
+        self.outputs.get(&meta)
     }
 
     /// Returns an iterator over all entries.
-    pub fn iter(&self) -> impl Iterator<Item = (PackageId, &BuildOutput)> {
-        self.outputs.iter().map(|(key, value)| (key.0, value))
+    pub fn iter(&self) -> impl Iterator<Item = (&Metadata, &BuildOutput)> {
+        self.outputs.iter()
     }
 }

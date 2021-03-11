@@ -5,22 +5,21 @@ use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use flate2::read::GzDecoder;
 use flate2::{Compression, GzBuilder};
 use log::debug;
-use tar::{Archive, Builder, EntryType, Header};
+use tar::{Archive, Builder, EntryType, Header, HeaderMode};
 
 use crate::core::compiler::{BuildConfig, CompileMode, DefaultExecutor, Executor};
-use crate::core::{Feature, Verbosity, Workspace};
+use crate::core::{Feature, Shell, Verbosity, Workspace};
 use crate::core::{Package, PackageId, PackageSet, Resolve, Source, SourceId};
-use crate::ops;
 use crate::sources::PathSource;
 use crate::util::errors::{CargoResult, CargoResultExt};
 use crate::util::paths;
 use crate::util::toml::TomlManifest;
-use crate::util::{self, Config, FileLock};
+use crate::util::{self, restricted_names, Config, FileLock};
+use crate::{drop_println, ops};
 
 pub struct PackageOpts<'cfg> {
     pub config: &'cfg Config,
@@ -29,7 +28,7 @@ pub struct PackageOpts<'cfg> {
     pub allow_dirty: bool,
     pub verify: bool,
     pub jobs: Option<u32>,
-    pub target: Option<String>,
+    pub targets: Vec<String>,
     pub features: Vec<String>,
     pub all_features: bool,
     pub no_default_features: bool,
@@ -50,8 +49,17 @@ struct ArchiveFile {
 enum FileContents {
     /// Absolute path to the file on disk to add to the archive.
     OnDisk(PathBuf),
-    /// Contents of a file generated in memory.
-    Generated(String),
+    /// Generates a file.
+    Generated(GeneratedFile),
+}
+
+enum GeneratedFile {
+    /// Generates `Cargo.toml` by rewriting the original.
+    Manifest,
+    /// Generates `Cargo.lock` in some cases (like if there is a binary).
+    Lockfile,
+    /// Adds a `.cargo-vcs_info.json` file if in a (clean) git repo.
+    VcsInfo(String),
 }
 
 pub fn package(ws: &Workspace<'_>, opts: &PackageOpts<'_>) -> CargoResult<Option<FileLock>> {
@@ -70,8 +78,6 @@ pub fn package(ws: &Workspace<'_>, opts: &PackageOpts<'_>) -> CargoResult<Option
     if opts.check_metadata {
         check_metadata(pkg, config)?;
     }
-
-    verify_dependencies(pkg)?;
 
     if !pkg.manifest().exclude().is_empty() && !pkg.manifest().include().is_empty() {
         config.shell().warn(
@@ -95,10 +101,12 @@ pub fn package(ws: &Workspace<'_>, opts: &PackageOpts<'_>) -> CargoResult<Option
 
     if opts.list {
         for ar_file in ar_files {
-            println!("{}", ar_file.rel_str);
+            drop_println!(config, "{}", ar_file.rel_str);
         }
         return Ok(None);
     }
+
+    verify_dependencies(pkg)?;
 
     let filename = format!("{}-{}.crate", pkg.name(), pkg.version());
     let dir = ws.target_dir().join("package");
@@ -142,7 +150,7 @@ fn build_ar_list(
     let root = pkg.root();
     for src_file in src_files {
         let rel_path = src_file.strip_prefix(&root)?.to_path_buf();
-        check_filename(&rel_path)?;
+        check_filename(&rel_path, &mut ws.config().shell())?;
         let rel_str = rel_path
             .to_str()
             .ok_or_else(|| {
@@ -156,11 +164,10 @@ fn build_ar_list(
                     rel_str: "Cargo.toml.orig".to_string(),
                     contents: FileContents::OnDisk(src_file),
                 });
-                let generated = pkg.to_registry_toml(ws.config())?;
                 result.push(ArchiveFile {
                     rel_path,
                     rel_str,
-                    contents: FileContents::Generated(generated),
+                    contents: FileContents::Generated(GeneratedFile::Manifest),
                 });
             }
             "Cargo.lock" => continue,
@@ -179,18 +186,17 @@ fn build_ar_list(
         }
     }
     if pkg.include_lockfile() {
-        let new_lock = build_lock(ws)?;
         result.push(ArchiveFile {
             rel_path: PathBuf::from("Cargo.lock"),
             rel_str: "Cargo.lock".to_string(),
-            contents: FileContents::Generated(new_lock),
+            contents: FileContents::Generated(GeneratedFile::Lockfile),
         });
     }
     if let Some(vcs_info) = vcs_info {
         result.push(ArchiveFile {
             rel_path: PathBuf::from(VCS_INFO_FILE),
             rel_str: VCS_INFO_FILE.to_string(),
-            contents: FileContents::Generated(vcs_info),
+            contents: FileContents::Generated(GeneratedFile::VcsInfo(vcs_info)),
         });
     }
     if let Some(license_file) = &pkg.manifest().metadata().license_file {
@@ -267,7 +273,7 @@ fn build_lock(ws: &Workspace<'_>) -> CargoResult<String> {
         orig_pkg
             .manifest()
             .original()
-            .prepare_for_publish(config, orig_pkg.root())?,
+            .prepare_for_publish(ws, orig_pkg.root())?,
     );
     let package_root = orig_pkg.root();
     let source_id = orig_pkg.package_id().source_id();
@@ -277,14 +283,14 @@ fn build_lock(ws: &Workspace<'_>) -> CargoResult<String> {
 
     // Regenerate Cargo.lock using the old one as a guide.
     let tmp_ws = Workspace::ephemeral(new_pkg, ws.config(), None, true)?;
-    let (pkg_set, new_resolve) = ops::resolve_ws(&tmp_ws)?;
+    let (pkg_set, mut new_resolve) = ops::resolve_ws(&tmp_ws)?;
 
     if let Some(orig_resolve) = orig_resolve {
         compare_resolve(config, tmp_ws.current()?, &orig_resolve, &new_resolve)?;
     }
     check_yanked(config, &pkg_set, &new_resolve)?;
 
-    ops::resolve_to_string(&tmp_ws, &new_resolve)
+    ops::resolve_to_string(&tmp_ws, &mut new_resolve)
 }
 
 // Checks that the package has some piece of metadata that a human can
@@ -494,28 +500,7 @@ fn tar(
         config
             .shell()
             .verbose(|shell| shell.status("Archiving", &rel_str))?;
-        // The `tar::Builder` type by default will build GNU archives, but
-        // unfortunately we force it here to use UStar archives instead. The
-        // UStar format has more limitations on the length of path name that it
-        // can encode, so it's not quite as nice to use.
-        //
-        // Older cargos, however, had a bug where GNU archives were interpreted
-        // as UStar archives. This bug means that if we publish a GNU archive
-        // which has fully filled out metadata it'll be corrupt when unpacked by
-        // older cargos.
-        //
-        // Hopefully in the future after enough cargos have been running around
-        // with the bugfixed tar-rs library we'll be able to switch this over to
-        // GNU archives, but for now we'll just say that you can't encode paths
-        // in archives that are *too* long.
-        //
-        // For an instance of this in the wild, use the tar-rs 0.3.3 library to
-        // unpack the selectors 0.4.0 crate on crates.io. Either that or take a
-        // look at rust-lang/cargo#2326.
-        let mut header = Header::new_ustar();
-        header
-            .set_path(&ar_path)
-            .chain_err(|| format!("failed to add to archive: `{}`", rel_str))?;
+        let mut header = Header::new_gnu();
         match contents {
             FileContents::OnDisk(disk_path) => {
                 let mut file = File::open(&disk_path).chain_err(|| {
@@ -524,24 +509,24 @@ fn tar(
                 let metadata = file.metadata().chain_err(|| {
                     format!("could not learn metadata for: `{}`", disk_path.display())
                 })?;
-                header.set_metadata(&metadata);
+                header.set_metadata_in_mode(&metadata, HeaderMode::Deterministic);
                 header.set_cksum();
-                ar.append(&header, &mut file).chain_err(|| {
-                    format!("could not archive source file `{}`", disk_path.display())
-                })?;
+                ar.append_data(&mut header, &ar_path, &mut file)
+                    .chain_err(|| {
+                        format!("could not archive source file `{}`", disk_path.display())
+                    })?;
             }
-            FileContents::Generated(contents) => {
+            FileContents::Generated(generated_kind) => {
+                let contents = match generated_kind {
+                    GeneratedFile::Manifest => pkg.to_registry_toml(ws)?,
+                    GeneratedFile::Lockfile => build_lock(ws)?,
+                    GeneratedFile::VcsInfo(s) => s,
+                };
                 header.set_entry_type(EntryType::file());
                 header.set_mode(0o644);
-                header.set_mtime(
-                    SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs(),
-                );
                 header.set_size(contents.len() as u64);
                 header.set_cksum();
-                ar.append(&header, contents.as_bytes())
+                ar.append_data(&mut header, &ar_path, contents.as_bytes())
                     .chain_err(|| format!("could not archive source file `{}`", rel_str))?;
             }
         }
@@ -689,7 +674,7 @@ fn run_verify(ws: &Workspace<'_>, tar: &FileLock, opts: &PackageOpts<'_>) -> Car
 
     let rustc_args = if pkg
         .manifest()
-        .features()
+        .unstable_features()
         .require(Feature::public_dependency())
         .is_ok()
     {
@@ -704,8 +689,7 @@ fn run_verify(ws: &Workspace<'_>, tar: &FileLock, opts: &PackageOpts<'_>) -> Car
     ops::compile_with_exec(
         &ws,
         &ops::CompileOptions {
-            config,
-            build_config: BuildConfig::new(config, opts.jobs, &opts.target, CompileMode::Build)?,
+            build_config: BuildConfig::new(config, opts.jobs, &opts.targets, CompileMode::Build)?,
             features: opts.features.clone(),
             no_default_features: opts.no_default_features,
             all_features: opts.all_features,
@@ -717,7 +701,7 @@ fn run_verify(ws: &Workspace<'_>, tar: &FileLock, opts: &PackageOpts<'_>) -> Car
             target_rustc_args: rustc_args,
             local_rustdoc_args: None,
             rustdoc_document_private_items: false,
-            export_dir: None,
+            honor_rust_version: true,
         },
         &exec,
     )?;
@@ -746,8 +730,8 @@ fn hash_all(path: &Path) -> CargoResult<HashMap<PathBuf, u64>> {
             let entry = entry?;
             let file_type = entry.file_type();
             if file_type.is_file() {
-                let contents = fs::read(entry.path())?;
-                let hash = util::hex::hash_u64(&contents);
+                let file = File::open(entry.path())?;
+                let hash = util::hex::hash_u64_file(&file)?;
                 result.insert(entry.path().to_path_buf(), hash);
             } else if file_type.is_symlink() {
                 let hash = util::hex::hash_u64(&fs::read_link(entry.path())?);
@@ -804,7 +788,7 @@ fn report_hash_difference(orig: &HashMap<PathBuf, u64>, after: &HashMap<PathBuf,
 //
 // To help out in situations like this, issue about weird filenames when
 // packaging as a "heads up" that something may not work on other platforms.
-fn check_filename(file: &Path) -> CargoResult<()> {
+fn check_filename(file: &Path, shell: &mut Shell) -> CargoResult<()> {
     let name = match file.file_name() {
         Some(name) => name,
         None => return Ok(()),
@@ -824,6 +808,13 @@ fn check_filename(file: &Path) -> CargoResult<()> {
             c,
             file.display()
         )
+    }
+    if restricted_names::is_windows_reserved_path(file) {
+        shell.warn(format!(
+            "file {} is a reserved Windows filename, \
+                it will not work on Windows platforms",
+            file.display()
+        ))?;
     }
     Ok(())
 }

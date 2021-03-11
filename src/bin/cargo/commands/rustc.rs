@@ -2,6 +2,8 @@ use crate::command_prelude::*;
 
 use cargo::ops;
 
+const PRINT_ARG_NAME: &str = "print";
+
 pub fn cli() -> App {
     subcommand("rustc")
         .setting(AppSettings::TrailingVarArg)
@@ -26,25 +28,20 @@ pub fn cli() -> App {
         .arg_profile("Build artifacts with the specified profile")
         .arg_features()
         .arg_target_triple("Target triple which compiles will be for")
+        .arg(
+            opt(
+                PRINT_ARG_NAME,
+                "Output compiler information without compiling",
+            )
+            .value_name("INFO"),
+        )
         .arg_target_dir()
         .arg_manifest_path()
         .arg_message_format()
-        .after_help(
-            "\
-The specified target for the current package (or package specified by SPEC if
-provided) will be compiled along with all of its dependencies. The specified
-<args>... will all be passed to the final compiler invocation, not any of the
-dependencies. Note that the compiler will still unconditionally receive
-arguments such as -L, --extern, and --crate-type, and the specified <args>...
-will simply be added to the compiler invocation.
-
-This command requires that only one target is being compiled. If more than one
-target is available for the current package the filters of --lib, --bin, etc,
-must be used to select which target is compiled. To pass flags to all compiler
-processes spawned by Cargo, use the $RUSTFLAGS environment variable or the
-`build.rustflags` configuration option.
-",
-        )
+        .arg_unit_graph()
+        .arg_ignore_rust_version()
+        .arg_future_incompat_report()
+        .after_help("Run `cargo help rustc` for more detailed information.\n")
 }
 
 pub fn exec(config: &mut Config, args: &ArgMatches<'_>) -> CliResult {
@@ -75,6 +72,13 @@ pub fn exec(config: &mut Config, args: &ArgMatches<'_>) -> CliResult {
     } else {
         Some(target_args)
     };
-    ops::compile(&ws, &compile_opts)?;
+    if let Some(opt_value) = args.value_of(PRINT_ARG_NAME) {
+        config
+            .cli_unstable()
+            .fail_if_stable_opt(PRINT_ARG_NAME, 8923)?;
+        ops::print(&ws, &compile_opts, opt_value)?;
+    } else {
+        ops::compile(&ws, &compile_opts)?;
+    }
     Ok(())
 }

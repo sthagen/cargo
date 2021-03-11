@@ -7,6 +7,7 @@ use std::iter;
 use std::path::{Component, Path, PathBuf};
 
 use filetime::FileTime;
+use tempfile::Builder as TempFileBuilder;
 
 use crate::util::errors::{CargoResult, CargoResultExt};
 
@@ -89,7 +90,7 @@ pub fn resolve_executable(exec: &Path) -> CargoResult<PathBuf> {
         let paths = env::var_os("PATH").ok_or_else(|| anyhow::format_err!("no PATH"))?;
         let candidates = env::split_paths(&paths).flat_map(|path| {
             let candidate = path.join(&exec);
-            let with_exe = if env::consts::EXE_EXTENSION == "" {
+            let with_exe = if env::consts::EXE_EXTENSION.is_empty() {
                 None
             } else {
                 Some(candidate.with_extension(env::consts::EXE_EXTENSION))
@@ -118,27 +119,12 @@ pub fn read(path: &Path) -> CargoResult<String> {
 }
 
 pub fn read_bytes(path: &Path) -> CargoResult<Vec<u8>> {
-    let res = (|| -> CargoResult<_> {
-        let mut ret = Vec::new();
-        let mut f = File::open(path)?;
-        if let Ok(m) = f.metadata() {
-            ret.reserve(m.len() as usize + 1);
-        }
-        f.read_to_end(&mut ret)?;
-        Ok(ret)
-    })()
-    .chain_err(|| format!("failed to read `{}`", path.display()))?;
-    Ok(res)
+    fs::read(path).chain_err(|| format!("failed to read `{}`", path.display()))
 }
 
-pub fn write(path: &Path, contents: &[u8]) -> CargoResult<()> {
-    (|| -> CargoResult<()> {
-        let mut f = File::create(path)?;
-        f.write_all(contents)?;
-        Ok(())
-    })()
-    .chain_err(|| format!("failed to write `{}`", path.display()))?;
-    Ok(())
+pub fn write<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C) -> CargoResult<()> {
+    let path = path.as_ref();
+    fs::write(path, contents.as_ref()).chain_err(|| format!("failed to write `{}`", path.display()))
 }
 
 pub fn write_if_changed<P: AsRef<Path>, C: AsRef<[u8]>>(path: P, contents: C) -> CargoResult<()> {
@@ -177,9 +163,102 @@ pub fn append(path: &Path, contents: &[u8]) -> CargoResult<()> {
     Ok(())
 }
 
+/// Creates a new file.
+pub fn create<P: AsRef<Path>>(path: P) -> CargoResult<File> {
+    let path = path.as_ref();
+    File::create(path).chain_err(|| format!("failed to create file `{}`", path.display()))
+}
+
+/// Opens an existing file.
+pub fn open<P: AsRef<Path>>(path: P) -> CargoResult<File> {
+    let path = path.as_ref();
+    File::open(path).chain_err(|| format!("failed to open file `{}`", path.display()))
+}
+
 pub fn mtime(path: &Path) -> CargoResult<FileTime> {
     let meta = fs::metadata(path).chain_err(|| format!("failed to stat `{}`", path.display()))?;
     Ok(FileTime::from_last_modification_time(&meta))
+}
+
+/// Returns the maximum mtime of the given path, recursing into
+/// subdirectories, and following symlinks.
+pub fn mtime_recursive(path: &Path) -> CargoResult<FileTime> {
+    let meta = fs::metadata(path).chain_err(|| format!("failed to stat `{}`", path.display()))?;
+    if !meta.is_dir() {
+        return Ok(FileTime::from_last_modification_time(&meta));
+    }
+    let max_meta = walkdir::WalkDir::new(path)
+        .follow_links(true)
+        .into_iter()
+        .filter_map(|e| match e {
+            Ok(e) => Some(e),
+            Err(e) => {
+                // Ignore errors while walking. If Cargo can't access it, the
+                // build script probably can't access it, either.
+                log::debug!("failed to determine mtime while walking directory: {}", e);
+                None
+            }
+        })
+        .filter_map(|e| {
+            if e.path_is_symlink() {
+                // Use the mtime of both the symlink and its target, to
+                // handle the case where the symlink is modified to a
+                // different target.
+                let sym_meta = match std::fs::symlink_metadata(e.path()) {
+                    Ok(m) => m,
+                    Err(err) => {
+                        // I'm not sure when this is really possible (maybe a
+                        // race with unlinking?). Regardless, if Cargo can't
+                        // read it, the build script probably can't either.
+                        log::debug!(
+                            "failed to determine mtime while fetching symlink metdata of {}: {}",
+                            e.path().display(),
+                            err
+                        );
+                        return None;
+                    }
+                };
+                let sym_mtime = FileTime::from_last_modification_time(&sym_meta);
+                // Walkdir follows symlinks.
+                match e.metadata() {
+                    Ok(target_meta) => {
+                        let target_mtime = FileTime::from_last_modification_time(&target_meta);
+                        Some(sym_mtime.max(target_mtime))
+                    }
+                    Err(err) => {
+                        // Can't access the symlink target. If Cargo can't
+                        // access it, the build script probably can't access
+                        // it either.
+                        log::debug!(
+                            "failed to determine mtime of symlink target for {}: {}",
+                            e.path().display(),
+                            err
+                        );
+                        Some(sym_mtime)
+                    }
+                }
+            } else {
+                let meta = match e.metadata() {
+                    Ok(m) => m,
+                    Err(err) => {
+                        // I'm not sure when this is really possible (maybe a
+                        // race with unlinking?). Regardless, if Cargo can't
+                        // read it, the build script probably can't either.
+                        log::debug!(
+                            "failed to determine mtime while fetching metadata of {}: {}",
+                            e.path().display(),
+                            err
+                        );
+                        return None;
+                    }
+                };
+                Some(FileTime::from_last_modification_time(&meta))
+            }
+        })
+        .max()
+        // or_else handles the case where there are no files in the directory.
+        .unwrap_or_else(|| FileTime::from_last_modification_time(&meta));
+    Ok(max_meta)
 }
 
 /// Record the current time on the filesystem (using the filesystem's clock)
@@ -190,9 +269,11 @@ pub fn set_invocation_time(path: &Path) -> CargoResult<FileTime> {
     let timestamp = path.join("invoked.timestamp");
     write(
         &timestamp,
-        b"This file has an mtime of when this was started.",
+        "This file has an mtime of when this was started.",
     )?;
-    mtime(&timestamp)
+    let ft = mtime(&timestamp)?;
+    log::debug!("invocation time for {:?} is {}", path, ft);
+    Ok(ft)
 }
 
 #[cfg(unix)]
@@ -225,8 +306,8 @@ pub fn bytes2path(bytes: &[u8]) -> CargoResult<PathBuf> {
     }
 }
 
-pub fn ancestors(path: &Path) -> PathAncestors<'_> {
-    PathAncestors::new(path)
+pub fn ancestors<'a>(path: &'a Path, stop_root_at: Option<&Path>) -> PathAncestors<'a> {
+    PathAncestors::new(path, stop_root_at)
 }
 
 pub struct PathAncestors<'a> {
@@ -235,11 +316,15 @@ pub struct PathAncestors<'a> {
 }
 
 impl<'a> PathAncestors<'a> {
-    fn new(path: &Path) -> PathAncestors<'_> {
+    fn new(path: &'a Path, stop_root_at: Option<&Path>) -> PathAncestors<'a> {
+        let stop_at = env::var("__CARGO_TEST_ROOT")
+            .ok()
+            .map(PathBuf::from)
+            .or_else(|| stop_root_at.map(|p| p.to_path_buf()));
         PathAncestors {
             current: Some(path),
             //HACK: avoid reading `~/.cargo/config` when testing Cargo itself.
-            stop_at: env::var("__CARGO_TEST_ROOT").ok().map(PathBuf::from),
+            stop_at,
         }
     }
 }
@@ -278,7 +363,11 @@ pub fn remove_dir_all<P: AsRef<Path>>(p: P) -> CargoResult<()> {
 }
 
 fn _remove_dir_all(p: &Path) -> CargoResult<()> {
-    if p.symlink_metadata()?.file_type().is_symlink() {
+    if p.symlink_metadata()
+        .chain_err(|| format!("could not get metadata for `{}` to remove", p.display()))?
+        .file_type()
+        .is_symlink()
+    {
         return remove_file(p);
     }
     let entries = p
@@ -405,4 +494,141 @@ fn _link_or_copy(src: &Path, dst: &Path) -> CargoResult<()> {
             )
         })?;
     Ok(())
+}
+
+/// Copies a file from one location to another.
+pub fn copy<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> CargoResult<u64> {
+    let from = from.as_ref();
+    let to = to.as_ref();
+    fs::copy(from, to)
+        .chain_err(|| format!("failed to copy `{}` to `{}`", from.display(), to.display()))
+}
+
+/// Changes the filesystem mtime (and atime if possible) for the given file.
+///
+/// This intentionally does not return an error, as this is sometimes not
+/// supported on network filesystems. For the current uses in Cargo, this is a
+/// "best effort" approach, and errors shouldn't be propagated.
+pub fn set_file_time_no_err<P: AsRef<Path>>(path: P, time: FileTime) {
+    let path = path.as_ref();
+    match filetime::set_file_times(path, time, time) {
+        Ok(()) => log::debug!("set file mtime {} to {}", path.display(), time),
+        Err(e) => log::warn!(
+            "could not set mtime of {} to {}: {:?}",
+            path.display(),
+            time,
+            e
+        ),
+    }
+}
+
+/// Strips `base` from `path`.
+///
+/// This canonicalizes both paths before stripping. This is useful if the
+/// paths are obtained in different ways, and one or the other may or may not
+/// have been normalized in some way.
+pub fn strip_prefix_canonical<P: AsRef<Path>>(
+    path: P,
+    base: P,
+) -> Result<PathBuf, std::path::StripPrefixError> {
+    // Not all filesystems support canonicalize. Just ignore if it doesn't work.
+    let safe_canonicalize = |path: &Path| match path.canonicalize() {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("cannot canonicalize {:?}: {:?}", path, e);
+            path.to_path_buf()
+        }
+    };
+    let canon_path = safe_canonicalize(path.as_ref());
+    let canon_base = safe_canonicalize(base.as_ref());
+    canon_path.strip_prefix(canon_base).map(|p| p.to_path_buf())
+}
+
+/// Creates an excluded from cache directory atomically with its parents as needed.
+///
+/// The atomicity only covers creating the leaf directory and exclusion from cache. Any missing
+/// parent directories will not be created in an atomic manner.
+///
+/// This function is idempotent and in addition to that it won't exclude ``p`` from cache if it
+/// already exists.
+pub fn create_dir_all_excluded_from_backups_atomic(p: impl AsRef<Path>) -> CargoResult<()> {
+    let path = p.as_ref();
+    if path.is_dir() {
+        return Ok(());
+    }
+
+    let parent = path.parent().unwrap();
+    let base = path.file_name().unwrap();
+    create_dir_all(parent)?;
+    // We do this in two steps (first create a temporary directory and exlucde
+    // it from backups, then rename it to the desired name. If we created the
+    // directory directly where it should be and then excluded it from backups
+    // we would risk a situation where cargo is interrupted right after the directory
+    // creation but before the exclusion the the directory would remain non-excluded from
+    // backups because we only perform exclusion right after we created the directory
+    // ourselves.
+    //
+    // We need the tempdir created in parent instead of $TMP, because only then we can be
+    // easily sure that rename() will succeed (the new name needs to be on the same mount
+    // point as the old one).
+    let tempdir = TempFileBuilder::new().prefix(base).tempdir_in(parent)?;
+    exclude_from_backups(tempdir.path());
+    // Previously std::fs::create_dir_all() (through paths::create_dir_all()) was used
+    // here to create the directory directly and fs::create_dir_all() explicitly treats
+    // the directory being created concurrently by another thread or process as success,
+    // hence the check below to follow the existing behavior. If we get an error at
+    // rename() and suddently the directory (which didn't exist a moment earlier) exists
+    // we can infer from it it's another cargo process doing work.
+    if let Err(e) = fs::rename(tempdir.path(), path) {
+        if !path.exists() {
+            return Err(anyhow::Error::from(e));
+        }
+    }
+    Ok(())
+}
+
+/// Marks the directory as excluded from archives/backups.
+///
+/// This is recommended to prevent derived/temporary files from bloating backups. There are two
+/// mechanisms used to achieve this right now:
+///
+/// * A dedicated resource property excluding from Time Machine backups on macOS
+/// * CACHEDIR.TAG files supported by various tools in a platform-independent way
+fn exclude_from_backups(path: &Path) {
+    exclude_from_time_machine(path);
+    let _ = std::fs::write(
+        path.join("CACHEDIR.TAG"),
+        "Signature: 8a477f597d28d172789f06886806bc55
+# This file is a cache directory tag created by cargo.
+# For information about cache directory tags see https://bford.info/cachedir/
+",
+    );
+    // Similarly to exclude_from_time_machine() we ignore errors here as it's an optional feature.
+}
+
+#[cfg(not(target_os = "macos"))]
+fn exclude_from_time_machine(_: &Path) {}
+
+#[cfg(target_os = "macos")]
+/// Marks files or directories as excluded from Time Machine on macOS
+fn exclude_from_time_machine(path: &Path) {
+    use core_foundation::base::TCFType;
+    use core_foundation::{number, string, url};
+    use std::ptr;
+
+    // For compatibility with 10.7 a string is used instead of global kCFURLIsExcludedFromBackupKey
+    let is_excluded_key: Result<string::CFString, _> = "NSURLIsExcludedFromBackupKey".parse();
+    let path = url::CFURL::from_path(path, false);
+    if let (Some(path), Ok(is_excluded_key)) = (path, is_excluded_key) {
+        unsafe {
+            url::CFURLSetResourcePropertyForKey(
+                path.as_concrete_TypeRef(),
+                is_excluded_key.as_concrete_TypeRef(),
+                number::kCFBooleanTrue as *const _,
+                ptr::null_mut(),
+            );
+        }
+    }
+    // Errors are ignored, since it's an optional feature and failure
+    // doesn't prevent Cargo from working
 }

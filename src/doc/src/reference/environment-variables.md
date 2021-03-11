@@ -24,6 +24,12 @@ system:
   specified wrapper instead, passing as its commandline arguments the rustc
   invocation, with the first argument being `rustc`. Useful to set up a build
   cache tool such as `sccache`. See [`build.rustc-wrapper`] to set via config.
+* `RUSTC_WORKSPACE_WRAPPER` — Instead of simply running `rustc`, Cargo will 
+  execute this specified wrapper instead for workspace members only, passing
+  as its commandline arguments the rustc invocation, with the first argument 
+  being `rustc`. It affects the filename hash so that artifacts produced by 
+  the wrapper are cached separately. See [`build.rustc-workspace-wrapper`] 
+  to set via config.
 * `RUSTDOC` — Instead of running `rustdoc`, Cargo will execute this specified
   `rustdoc` instance instead. See [`build.rustdoc`] to set via config.
 * `RUSTDOCFLAGS` — A space-separated list of custom flags to pass to all `rustdoc`
@@ -49,6 +55,9 @@ system:
 * `TERM` — If this is set to `dumb`, it disables the progress bar.
 * `BROWSER` — The web browser to execute to open documentation with [`cargo
   doc`]'s' `--open` flag.
+* `RUSTFMT` — Instead of running `rustfmt`,
+  [`cargo fmt`](https://github.com/rust-lang/rustfmt) will execute this specified
+  `rustfmt` instance instead.
 
 #### Configuration environment variables
 
@@ -60,6 +69,7 @@ supported environment variables are:
 * `CARGO_BUILD_JOBS` — Number of parallel jobs, see [`build.jobs`].
 * `CARGO_BUILD_RUSTC` — The `rustc` executable, see [`build.rustc`].
 * `CARGO_BUILD_RUSTC_WRAPPER` — The `rustc` wrapper, see [`build.rustc-wrapper`].
+* `CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER` — The `rustc` wrapper for workspace members only, see [`build.rustc-workspace-wrapper`].
 * `CARGO_BUILD_RUSTDOC` — The `rustdoc` executable, see [`build.rustdoc`].
 * `CARGO_BUILD_TARGET` — The default target platform, see [`build.target`].
 * `CARGO_BUILD_TARGET_DIR` — The default output directory, see [`build.target-dir`].
@@ -98,16 +108,19 @@ supported environment variables are:
 * `CARGO_REGISTRIES_<name>_TOKEN` — Authentication token of a registry, see [`registries.<name>.token`].
 * `CARGO_REGISTRY_DEFAULT` — Default registry for the `--registry` flag, see [`registry.default`].
 * `CARGO_REGISTRY_TOKEN` — Authentication token for [crates.io], see [`registry.token`].
-* `CARGO_TARGET_<triple>_LINKER` — The linker to use, see [`target.<triple>.linker`].
+* `CARGO_TARGET_<triple>_LINKER` — The linker to use, see [`target.<triple>.linker`]. The triple must be [converted to uppercase and underscores](config.md#environment-variables).
 * `CARGO_TARGET_<triple>_RUNNER` — The executable runner, see [`target.<triple>.runner`].
 * `CARGO_TARGET_<triple>_RUSTFLAGS` — Extra `rustc` flags for a target, see [`target.<triple>.rustflags`].
 * `CARGO_TERM_VERBOSE` — The default terminal verbosity, see [`term.verbose`].
 * `CARGO_TERM_COLOR` — The default color mode, see [`term.color`].
+* `CARGO_TERM_PROGRESS_WHEN` — The default progress bar showing mode, see [`term.progress.when`].
+* `CARGO_TERM_PROGRESS_WIDTH` — The default progress bar width, see [`term.progress.width`].
 
 [`cargo doc`]: ../commands/cargo-doc.md
 [`cargo install`]: ../commands/cargo-install.md
 [`cargo new`]: ../commands/cargo-new.md
 [`cargo rustc`]: ../commands/cargo-rustc.md
+[`cargo rustdoc`]: ../commands/cargo-rustdoc.md
 [config-env]: config.md#environment-variables
 [crates.io]: https://crates.io/
 [incremental compilation]: profiles.md#incremental
@@ -115,6 +128,7 @@ supported environment variables are:
 [`build.jobs`]: config.md#buildjobs
 [`build.rustc`]: config.md#buildrustc
 [`build.rustc-wrapper`]: config.md#buildrustc-wrapper
+[`build.rustc-workspace-wrapper`]: config.md#buildrustc-workspace-wrapper
 [`build.rustdoc`]: config.md#buildrustdoc
 [`build.target`]: config.md#buildtarget
 [`build.target-dir`]: config.md#buildtarget-dir
@@ -158,6 +172,8 @@ supported environment variables are:
 [`target.<triple>.rustflags`]: config.md#targettriplerustflags
 [`term.verbose`]: config.md#termverbose
 [`term.color`]: config.md#termcolor
+[`term.progress.when`]: config.md#termprogresswhen
+[`term.progress.width`]: config.md#termprogresswidth
 
 ### Environment variables Cargo sets for crates
 
@@ -166,11 +182,14 @@ Note that this applies for running binaries with `cargo run` and `cargo test`
 as well. To get the value of any of these variables in a Rust program, do
 this:
 
-```rust
+```rust,ignore
 let version = env!("CARGO_PKG_VERSION");
 ```
 
 `version` will now contain the value of `CARGO_PKG_VERSION`.
+
+Note that if one of these values is not provided in the manifest, the
+corresponding environment variable is set to the empty string, `""`.
 
 * `CARGO` — Path to the `cargo` binary performing the build.
 * `CARGO_MANIFEST_DIR` — The directory containing the manifest of your package.
@@ -184,6 +203,10 @@ let version = env!("CARGO_PKG_VERSION");
 * `CARGO_PKG_DESCRIPTION` — The description from the manifest of your package.
 * `CARGO_PKG_HOMEPAGE` — The home page from the manifest of your package.
 * `CARGO_PKG_REPOSITORY` — The repository from the manifest of your package.
+* `CARGO_PKG_LICENSE` — The license from the manifest of your package.
+* `CARGO_PKG_LICENSE_FILE` — The license file from the manifest of your package.
+* `CARGO_CRATE_NAME` — The name of the crate that is currently being compiled.
+* `CARGO_BIN_NAME` — The name of the binary that is currently being compiled (if it is a binary). This name does not include any file extension, such as `.exe`.
 * `OUT_DIR` — If the package has a build script, this is set to the folder where the build
               script should place its output. See below for more information.
               (Only set during compilation.)
@@ -194,6 +217,12 @@ let version = env!("CARGO_PKG_VERSION");
   example, `CARGO_BIN_EXE_my-program` for a binary named `my-program`.
   Binaries are automatically built when the test is built, unless the binary
   has required features that are not enabled.
+* `CARGO_PRIMARY_PACKAGE` — This environment variable will be set if the
+  package being built is primary. Primary packages are the ones the user
+  selected on the command-line, either with `-p` flags or the defaults based
+  on the current directory and the default workspace members. This environment
+  variable will not be set when building dependencies. This is only set when
+  compiling the package (not when running binaries or tests).
 
 [integration test]: cargo-targets.md#integration-tests
 [`env` macro]: ../../std/macro.env.html
@@ -231,7 +260,7 @@ Cargo sets several environment variables when build scripts are run. Because the
 are not yet set when the build script is compiled, the above example using `env!` won't work
 and instead you'll need to retrieve the values when the build script is run:
 
-```rust
+```rust,ignore
 use std::env;
 let out_dir = env::var("OUT_DIR").unwrap();
 ```
@@ -245,6 +274,15 @@ let out_dir = env::var("OUT_DIR").unwrap();
                          current working directory of the build script when it
                          starts.
 * `CARGO_MANIFEST_LINKS` — the manifest `links` value.
+* `CARGO_MAKEFLAGS` — Contains parameters needed for Cargo's [jobserver]
+                      implementation to parallelize subprocesses.
+                      Rustc or cargo invocations from build.rs can already
+                      read `CARGO_MAKEFLAGS`, but GNU Make requires the
+                      flags to be specified either directly as arguments,
+                      or through the `MAKEFLAGS` environment variable.
+                      Currently Cargo doesn't set the `MAKEFLAGS` variable,
+                      but it's free for build scripts invoking GNU Make
+                      to set it to the contents of `CARGO_MAKEFLAGS`.
 * `CARGO_FEATURE_<name>` — For each activated feature of the package being
                            built, this environment variable will be present
                            where `<name>` is the name of the feature uppercased
@@ -280,10 +318,9 @@ let out_dir = env::var("OUT_DIR").unwrap();
                that care should be taken when interpreting this environment
                variable. For historical purposes this is still provided but
                recent versions of Cargo, for example, do not need to run `make
-               -j` as it'll automatically happen. Cargo implements its own
-               [jobserver] and will allow build scripts to inherit this
-               information, so programs compatible with GNU make jobservers will
-               already have appropriately configured parallelism.
+               -j`, and instead can set the `MAKEFLAGS` env var to the content
+               of `CARGO_MAKEFLAGS` to activate the use of Cargo's GNU Make
+               compatible [jobserver] for sub-make invocations.
 * `OPT_LEVEL`, `DEBUG` — values of the corresponding variables for the
                          profile currently being built.
 * `PROFILE` — `release` for release builds, `debug` for other builds.
@@ -294,7 +331,7 @@ let out_dir = env::var("OUT_DIR").unwrap();
                        use it as well.
 * `RUSTC_LINKER` — The path to the linker binary that Cargo has resolved to use
                    for the current target, if specified. The linker can be
-                   changed by editing `.cargo/config`; see the documentation
+                   changed by editing `.cargo/config.toml`; see the documentation
                    about [cargo configuration][cargo-config] for more
                    information.
 

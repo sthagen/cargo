@@ -8,13 +8,12 @@ use crate::core::compiler::BuildContext;
 use crate::core::PackageId;
 use crate::util::cpu::State;
 use crate::util::machine_message::{self, Message};
-use crate::util::{paths, CargoResult, Config};
+use crate::util::{paths, CargoResult, CargoResultExt, Config};
 use std::collections::HashMap;
-use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::time::{Duration, Instant, SystemTime};
 
-pub struct Timings<'a, 'cfg> {
+pub struct Timings<'cfg> {
     config: &'cfg Config,
     /// Whether or not timings should be captured.
     enabled: bool,
@@ -39,10 +38,10 @@ pub struct Timings<'a, 'cfg> {
     /// Total number of dirty units.
     total_dirty: u32,
     /// Time tracking for each individual unit.
-    unit_times: Vec<UnitTime<'a>>,
+    unit_times: Vec<UnitTime>,
     /// Units that are in the process of being built.
     /// When they finished, they are moved to `unit_times`.
-    active: HashMap<JobId, UnitTime<'a>>,
+    active: HashMap<JobId, UnitTime>,
     /// Concurrency-tracking information. This is periodically updated while
     /// compilation progresses.
     concurrency: Vec<Concurrency>,
@@ -56,8 +55,8 @@ pub struct Timings<'a, 'cfg> {
 }
 
 /// Tracking information for an individual unit.
-struct UnitTime<'a> {
-    unit: Unit<'a>,
+struct UnitTime {
+    unit: Unit,
     /// A string describing the cargo target.
     target: String,
     /// The time when this unit started as an offset in seconds from `Timings::start`.
@@ -68,9 +67,9 @@ struct UnitTime<'a> {
     /// from `start`.
     rmeta_time: Option<f64>,
     /// Reverse deps that are freed to run after this unit finished.
-    unlocked_units: Vec<Unit<'a>>,
+    unlocked_units: Vec<Unit>,
     /// Same as `unlocked_units`, but unlocked by rmeta.
-    unlocked_rmeta_units: Vec<Unit<'a>>,
+    unlocked_rmeta_units: Vec<Unit>,
 }
 
 /// Periodic concurrency tracking information.
@@ -91,8 +90,8 @@ struct Concurrency {
     rustc_parallelism: usize,
 }
 
-impl<'a, 'cfg> Timings<'a, 'cfg> {
-    pub fn new(bcx: &BuildContext<'a, 'cfg>, root_units: &[Unit<'_>]) -> Timings<'a, 'cfg> {
+impl<'cfg> Timings<'cfg> {
+    pub fn new(bcx: &BuildContext<'_, 'cfg>, root_units: &[Unit]) -> Timings<'cfg> {
         let has_report = |what| {
             bcx.config
                 .cli_unstable()
@@ -122,6 +121,17 @@ impl<'a, 'cfg> Timings<'a, 'cfg> {
             .collect();
         let start_str = humantime::format_rfc3339_seconds(SystemTime::now()).to_string();
         let profile = bcx.build_config.requested_profile.to_string();
+        let last_cpu_state = if enabled {
+            match State::current() {
+                Ok(state) => Some(state),
+                Err(e) => {
+                    log::info!("failed to get CPU state, CPU tracking disabled: {:?}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         Timings {
             config: bcx.config,
@@ -138,14 +148,14 @@ impl<'a, 'cfg> Timings<'a, 'cfg> {
             unit_times: Vec::new(),
             active: HashMap::new(),
             concurrency: Vec::new(),
-            last_cpu_state: if enabled { State::current().ok() } else { None },
+            last_cpu_state,
             last_cpu_recording: Instant::now(),
             cpu_usage: Vec::new(),
         }
     }
 
     /// Mark that a unit has started running.
-    pub fn unit_start(&mut self, id: JobId, unit: Unit<'a>) {
+    pub fn unit_start(&mut self, id: JobId, unit: Unit) {
         if !self.enabled {
             return;
         }
@@ -169,7 +179,7 @@ impl<'a, 'cfg> Timings<'a, 'cfg> {
         let unit_time = UnitTime {
             unit,
             target,
-            start: d_as_f64(self.start.elapsed()),
+            start: self.start.elapsed().as_secs_f64(),
             duration: 0.0,
             rmeta_time: None,
             unlocked_units: Vec::new(),
@@ -179,7 +189,7 @@ impl<'a, 'cfg> Timings<'a, 'cfg> {
     }
 
     /// Mark that the `.rmeta` file as generated.
-    pub fn unit_rmeta_finished(&mut self, id: JobId, unlocked: Vec<&Unit<'a>>) {
+    pub fn unit_rmeta_finished(&mut self, id: JobId, unlocked: Vec<&Unit>) {
         if !self.enabled {
             return;
         }
@@ -190,14 +200,16 @@ impl<'a, 'cfg> Timings<'a, 'cfg> {
             Some(ut) => ut,
             None => return,
         };
-        let t = d_as_f64(self.start.elapsed());
+        let t = self.start.elapsed().as_secs_f64();
         unit_time.rmeta_time = Some(t - unit_time.start);
         assert!(unit_time.unlocked_rmeta_units.is_empty());
-        unit_time.unlocked_rmeta_units.extend(unlocked);
+        unit_time
+            .unlocked_rmeta_units
+            .extend(unlocked.iter().cloned().cloned());
     }
 
     /// Mark that a unit has finished running.
-    pub fn unit_finished(&mut self, id: JobId, unlocked: Vec<&Unit<'a>>) {
+    pub fn unit_finished(&mut self, id: JobId, unlocked: Vec<&Unit>) {
         if !self.enabled {
             return;
         }
@@ -206,10 +218,12 @@ impl<'a, 'cfg> Timings<'a, 'cfg> {
             Some(ut) => ut,
             None => return,
         };
-        let t = d_as_f64(self.start.elapsed());
+        let t = self.start.elapsed().as_secs_f64();
         unit_time.duration = t - unit_time.start;
         assert!(unit_time.unlocked_units.is_empty());
-        unit_time.unlocked_units.extend(unlocked);
+        unit_time
+            .unlocked_units
+            .extend(unlocked.iter().cloned().cloned());
         if self.report_info {
             let msg = format!(
                 "{}{} in {:.1}s",
@@ -225,13 +239,13 @@ impl<'a, 'cfg> Timings<'a, 'cfg> {
         if self.report_json {
             let msg = machine_message::TimingInfo {
                 package_id: unit_time.unit.pkg.package_id(),
-                target: unit_time.unit.target,
+                target: &unit_time.unit.target,
                 mode: unit_time.unit.mode,
                 duration: unit_time.duration,
                 rmeta_time: unit_time.rmeta_time,
             }
             .to_json_string();
-            self.config.shell().stdout_println(msg);
+            crate::drop_println!(self.config, "{}", msg);
         }
         self.unit_times.push(unit_time);
     }
@@ -248,7 +262,7 @@ impl<'a, 'cfg> Timings<'a, 'cfg> {
             return;
         }
         let c = Concurrency {
-            t: d_as_f64(self.start.elapsed()),
+            t: self.start.elapsed().as_secs_f64(),
             active,
             waiting,
             inactive,
@@ -283,12 +297,15 @@ impl<'a, 'cfg> Timings<'a, 'cfg> {
         }
         let current = match State::current() {
             Ok(s) => s,
-            Err(_) => return,
+            Err(e) => {
+                log::info!("failed to get CPU state: {:?}", e);
+                return;
+            }
         };
         let pct_idle = current.idle_since(prev);
         *prev = current;
         self.last_cpu_recording = now;
-        let dur = d_as_f64(now.duration_since(self.start));
+        let dur = now.duration_since(self.start).as_secs_f64();
         self.cpu_usage.push((dur, 100.0 - pct_idle));
     }
 
@@ -305,7 +322,8 @@ impl<'a, 'cfg> Timings<'a, 'cfg> {
         self.unit_times
             .sort_unstable_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
         if self.report_html {
-            self.report_html(bcx, error)?;
+            self.report_html(bcx, error)
+                .chain_err(|| "failed to save timing report")?;
         }
         Ok(())
     }
@@ -316,10 +334,10 @@ impl<'a, 'cfg> Timings<'a, 'cfg> {
         bcx: &BuildContext<'_, '_>,
         error: &Option<anyhow::Error>,
     ) -> CargoResult<()> {
-        let duration = d_as_f64(self.start.elapsed());
+        let duration = self.start.elapsed().as_secs_f64();
         let timestamp = self.start_str.replace(&['-', ':'][..], "");
         let filename = format!("cargo-timing-{}.html", timestamp);
-        let mut f = BufWriter::new(File::create(&filename)?);
+        let mut f = BufWriter::new(paths::create(&filename)?);
         let roots: Vec<&str> = self
             .root_targets
             .iter()
@@ -456,11 +474,11 @@ impl<'a, 'cfg> Timings<'a, 'cfg> {
 
     fn write_js_data(&self, f: &mut impl Write) -> CargoResult<()> {
         // Create a map to link indices of unlocked units.
-        let unit_map: HashMap<Unit<'_>, usize> = self
+        let unit_map: HashMap<Unit, usize> = self
             .unit_times
             .iter()
             .enumerate()
-            .map(|(i, ut)| (ut.unit, i))
+            .map(|(i, ut)| (ut.unit.clone(), i))
             .collect();
         #[derive(serde::Serialize)]
         struct UnitData {
@@ -551,7 +569,7 @@ impl<'a, 'cfg> Timings<'a, 'cfg> {
   <tbody>
 "#
         )?;
-        let mut units: Vec<&UnitTime<'_>> = self.unit_times.iter().collect();
+        let mut units: Vec<&UnitTime> = self.unit_times.iter().collect();
         units.sort_unstable_by(|a, b| b.duration.partial_cmp(&a.duration).unwrap());
         for (i, unit) in units.iter().enumerate() {
             let codegen = match unit.codegen_time() {
@@ -583,7 +601,7 @@ impl<'a, 'cfg> Timings<'a, 'cfg> {
     }
 }
 
-impl<'a> UnitTime<'a> {
+impl UnitTime {
     /// Returns the codegen time as (rmeta_time, codegen_time, percent of total)
     fn codegen_time(&self) -> Option<(f64, f64, f64)> {
         self.rmeta_time.map(|rmeta_time| {
@@ -598,11 +616,6 @@ impl<'a> UnitTime<'a> {
     }
 }
 
-// Replace with as_secs_f64 when 1.38 hits stable.
-fn d_as_f64(d: Duration) -> f64 {
-    (d.as_secs() as f64) + f64::from(d.subsec_nanos()) / 1_000_000_000.0
-}
-
 fn render_rustc_info(bcx: &BuildContext<'_, '_>) -> String {
     let version = bcx
         .rustc()
@@ -610,7 +623,13 @@ fn render_rustc_info(bcx: &BuildContext<'_, '_>) -> String {
         .lines()
         .next()
         .expect("rustc version");
-    let requested_target = bcx.target_data.short_name(&bcx.build_config.requested_kind);
+    let requested_target = bcx
+        .build_config
+        .requested_kinds
+        .iter()
+        .map(|kind| bcx.target_data.short_name(kind))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
         "{}<br>Host: {}<br>Target: {}",
         version,

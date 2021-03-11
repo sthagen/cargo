@@ -1,6 +1,4 @@
-//! Tests for build.rs rerun-if-env-changed.
-
-use std::fs::File;
+//! Tests for build.rs rerun-if-env-changed and rustc-env
 
 use cargo_test_support::project;
 use cargo_test_support::sleep_ms;
@@ -12,10 +10,10 @@ fn rerun_if_env_changes() {
         .file(
             "build.rs",
             r#"
-            fn main() {
-                println!("cargo:rerun-if-env-changed=FOO");
-            }
-        "#,
+                fn main() {
+                    println!("cargo:rerun-if-env-changed=FOO");
+                }
+            "#,
         )
         .build();
 
@@ -66,11 +64,11 @@ fn rerun_if_env_or_file_changes() {
         .file(
             "build.rs",
             r#"
-            fn main() {
-                println!("cargo:rerun-if-env-changed=FOO");
-                println!("cargo:rerun-if-changed=foo");
-            }
-        "#,
+                fn main() {
+                    println!("cargo:rerun-if-env-changed=FOO");
+                    println!("cargo:rerun-if-changed=foo");
+                }
+            "#,
         )
         .file("foo", "")
         .build();
@@ -97,7 +95,7 @@ fn rerun_if_env_or_file_changes() {
         .with_stderr("[FINISHED] [..]")
         .run();
     sleep_ms(1000);
-    File::create(p.root().join("foo")).unwrap();
+    p.change_file("foo", "");
     p.cargo("build")
         .env("FOO", "bar")
         .with_stderr(
@@ -106,5 +104,29 @@ fn rerun_if_env_or_file_changes() {
 [FINISHED] [..]
 ",
         )
+        .run();
+}
+
+#[cargo_test]
+fn rustc_bootstrap() {
+    let p = project()
+        .file("src/main.rs", "fn main() {}")
+        .file(
+            "build.rs",
+            r#"
+            fn main() {
+                println!("cargo:rustc-env=RUSTC_BOOTSTRAP=1");
+            }
+        "#,
+        )
+        .build();
+    p.cargo("build")
+        .with_stderr_contains("error: Cannot set `RUSTC_BOOTSTRAP=1` [..]")
+        .with_stderr_contains("help: [..] set the environment variable `RUSTC_BOOTSTRAP=foo` [..]")
+        .with_status(101)
+        .run();
+    p.cargo("build")
+        .masquerade_as_nightly_cargo()
+        .with_stderr_contains("warning: Cannot set `RUSTC_BOOTSTRAP=1` [..]")
         .run();
 }

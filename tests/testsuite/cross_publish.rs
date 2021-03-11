@@ -14,24 +14,24 @@ fn simple_cross_package() {
         .file(
             "Cargo.toml",
             r#"
-            [package]
-            name = "foo"
-            version = "0.0.0"
-            authors = []
-            license = "MIT"
-            description = "foo"
-            repository = "bar"
-        "#,
+                [package]
+                name = "foo"
+                version = "0.0.0"
+                authors = []
+                license = "MIT"
+                description = "foo"
+                repository = "bar"
+            "#,
         )
         .file(
             "src/main.rs",
             &format!(
                 r#"
-            use std::env;
-            fn main() {{
-                assert_eq!(env::consts::ARCH, "{}");
-            }}
-        "#,
+                    use std::env;
+                    fn main() {{
+                        assert_eq!(env::consts::ARCH, "{}");
+                    }}
+                "#,
                 cross_compile::alternate_arch()
             ),
         )
@@ -72,24 +72,24 @@ fn publish_with_target() {
         .file(
             "Cargo.toml",
             r#"
-            [package]
-            name = "foo"
-            version = "0.0.0"
-            authors = []
-            license = "MIT"
-            description = "foo"
-            repository = "bar"
-        "#,
+                [package]
+                name = "foo"
+                version = "0.0.0"
+                authors = []
+                license = "MIT"
+                description = "foo"
+                repository = "bar"
+            "#,
         )
         .file(
             "src/main.rs",
             &format!(
                 r#"
-            use std::env;
-            fn main() {{
-                assert_eq!(env::consts::ARCH, "{}");
-            }}
-        "#,
+                    use std::env;
+                    fn main() {{
+                        assert_eq!(env::consts::ARCH, "{}");
+                    }}
+                "#,
                 cross_compile::alternate_arch()
             ),
         )
@@ -97,8 +97,7 @@ fn publish_with_target() {
 
     let target = cross_compile::alternate();
 
-    p.cargo("publish --index")
-        .arg(registry::registry_url().to_string())
+    p.cargo("publish --token sekrit")
         .arg("--target")
         .arg(&target)
         .with_stderr(&format!(

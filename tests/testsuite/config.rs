@@ -1,7 +1,8 @@
 //! Tests for config settings.
 
-use cargo::core::{enable_nightly_features, InternedString, Shell};
+use cargo::core::Shell;
 use cargo::util::config::{self, Config, SslVersionConfig, StringList};
+use cargo::util::interning::InternedString;
 use cargo::util::toml::{self, VecStringOrBool as VSOB};
 use cargo::CargoResult;
 use cargo_test_support::{normalized_lines_match, paths, project, t};
@@ -19,6 +20,7 @@ pub struct ConfigBuilder {
     unstable: Vec<String>,
     config_args: Vec<String>,
     cwd: Option<PathBuf>,
+    enable_nightly_features: bool,
 }
 
 impl ConfigBuilder {
@@ -28,6 +30,7 @@ impl ConfigBuilder {
             unstable: Vec::new(),
             config_args: Vec::new(),
             cwd: None,
+            enable_nightly_features: false,
         }
     }
 
@@ -40,6 +43,12 @@ impl ConfigBuilder {
     /// Sets an environment variable.
     pub fn env(&mut self, key: impl Into<String>, val: impl Into<String>) -> &mut Self {
         self.env.insert(key.into(), val.into());
+        self
+    }
+
+    /// Unconditionaly enable nightly features, even on stable channels.
+    pub fn nightly_features_allowed(&mut self, allowed: bool) -> &mut Self {
+        self.enable_nightly_features = allowed;
         self
     }
 
@@ -66,16 +75,14 @@ impl ConfigBuilder {
 
     /// Creates the `Config`, returning a Result.
     pub fn build_err(&self) -> CargoResult<Config> {
-        if !self.unstable.is_empty() {
-            // This is unfortunately global. Some day that should be fixed.
-            enable_nightly_features();
-        }
         let output = Box::new(fs::File::create(paths::root().join("shell.out")).unwrap());
         let shell = Shell::from_write(output);
         let cwd = self.cwd.clone().unwrap_or_else(|| paths::root());
         let homedir = paths::home();
         let mut config = Config::new(shell, cwd, homedir);
+        config.nightly_features_allowed = self.enable_nightly_features || !self.unstable.is_empty();
         config.set_env(self.env.clone());
+        config.set_search_stop_path(paths::root());
         config.configure(
             0,
             false,
@@ -108,22 +115,22 @@ fn read_env_vars_for_config() {
         .file(
             "Cargo.toml",
             r#"
-            [package]
-            name = "foo"
-            authors = []
-            version = "0.0.0"
-            build = "build.rs"
-        "#,
+                [package]
+                name = "foo"
+                authors = []
+                version = "0.0.0"
+                build = "build.rs"
+            "#,
         )
         .file("src/lib.rs", "")
         .file(
             "build.rs",
             r#"
-            use std::env;
-            fn main() {
-                assert_eq!(env::var("NUM_JOBS").unwrap(), "100");
-            }
-        "#,
+                use std::env;
+                fn main() {
+                    assert_eq!(env::var("NUM_JOBS").unwrap(), "100");
+                }
+            "#,
         )
         .build();
 
@@ -182,6 +189,7 @@ fn symlink_config_to_config_toml() {
     t!(symlink_file(&toml_path, &symlink_path));
 }
 
+#[track_caller]
 pub fn assert_error<E: Borrow<anyhow::Error>>(error: E, msgs: &str) {
     let causes = error
         .borrow()
@@ -199,6 +207,7 @@ pub fn assert_error<E: Borrow<anyhow::Error>>(error: E, msgs: &str) {
     assert_match(msgs, &causes);
 }
 
+#[track_caller]
 pub fn assert_match(expected: &str, actual: &str) {
     if !normalized_lines_match(expected, actual, None) {
         panic!(
@@ -574,7 +583,7 @@ opt-level = 'foo'
 error in [..]/.cargo/config: could not load config key `profile.dev.opt-level`
 
 Caused by:
-  must be an integer, `z`, or `s`, but found: foo",
+  must be an integer, `z`, or `s`, but found the string: \"foo\"",
     );
 
     let config = ConfigBuilder::new()
@@ -587,7 +596,7 @@ Caused by:
 error in environment variable `CARGO_PROFILE_DEV_OPT_LEVEL`: could not load config key `profile.dev.opt-level`
 
 Caused by:
-  must be an integer, `z`, or `s`, but found: asdf",
+  must be an integer, `z`, or `s`, but found the string: \"asdf\"",
     );
 }
 
@@ -685,10 +694,7 @@ Caused by:
         f3: i64,
         big: i64,
     }
-    assert_error(
-        config.get::<S>("S").unwrap_err(),
-        "missing config key `S.f3`",
-    );
+    assert_error(config.get::<S>("S").unwrap_err(), "missing field `f3`");
 }
 
 #[cargo_test]
@@ -795,7 +801,7 @@ expected a list, but found a integer for `l3` in [..]/.cargo/config",
     assert_error(
         config.get::<L>("bad-env").unwrap_err(),
         "error in environment variable `CARGO_BAD_ENV`: \
-         could not parse TOML list: invalid number at line 1 column 8",
+         could not parse TOML list: invalid TOML value, did you mean to use a quoted string? at line 1 column 8",
     );
 
     // Try some other sequence-like types.
@@ -1093,6 +1099,76 @@ Caused by:
 }
 
 #[cargo_test]
+/// Assert that unstable options can be configured with the `unstable` table in
+/// cargo config files
+fn unstable_table_notation() {
+    write_config(
+        "\
+[unstable]
+print-im-a-teapot = true
+",
+    );
+    let config = ConfigBuilder::new().nightly_features_allowed(true).build();
+    assert_eq!(config.cli_unstable().print_im_a_teapot, true);
+}
+
+#[cargo_test]
+/// Assert that dotted notation works for configuring unstable options
+fn unstable_dotted_notation() {
+    write_config(
+        "\
+unstable.print-im-a-teapot = true
+",
+    );
+    let config = ConfigBuilder::new().nightly_features_allowed(true).build();
+    assert_eq!(config.cli_unstable().print_im_a_teapot, true);
+}
+
+#[cargo_test]
+/// Assert that Zflags on the CLI take precedence over those from config
+fn unstable_cli_precedence() {
+    write_config(
+        "\
+unstable.print-im-a-teapot = true
+",
+    );
+    let config = ConfigBuilder::new().nightly_features_allowed(true).build();
+    assert_eq!(config.cli_unstable().print_im_a_teapot, true);
+
+    let config = ConfigBuilder::new()
+        .unstable_flag("print-im-a-teapot=no")
+        .build();
+    assert_eq!(config.cli_unstable().print_im_a_teapot, false);
+}
+
+#[cargo_test]
+/// Assert that atempting to set an unstable flag that doesn't exist via config
+/// is ignored on stable
+fn unstable_invalid_flag_ignored_on_stable() {
+    write_config(
+        "\
+unstable.an-invalid-flag = 'yes'
+",
+    );
+    assert!(ConfigBuilder::new().build_err().is_ok());
+}
+
+#[cargo_test]
+/// Assert that unstable options can be configured with the `unstable` table in
+/// cargo config files
+fn unstable_flags_ignored_on_stable() {
+    write_config(
+        "\
+[unstable]
+print-im-a-teapot = true
+",
+    );
+    // Enforce stable channel even when testing on nightly.
+    let config = ConfigBuilder::new().nightly_features_allowed(false).build();
+    assert_eq!(config.cli_unstable().print_im_a_teapot, false);
+}
+
+#[cargo_test]
 fn table_merge_failure() {
     // Config::merge fails to merge entries in two tables.
     write_config_at(
@@ -1176,6 +1252,27 @@ fn struct_with_opt_inner_struct() {
 }
 
 #[cargo_test]
+fn struct_with_default_inner_struct() {
+    // Struct with serde defaults.
+    // Check that can be defined with environment variable.
+    #[derive(Deserialize, Default)]
+    #[serde(default)]
+    struct Inner {
+        value: i32,
+    }
+    #[derive(Deserialize, Default)]
+    #[serde(default)]
+    struct Foo {
+        inner: Inner,
+    }
+    let config = ConfigBuilder::new()
+        .env("CARGO_FOO_INNER_VALUE", "12")
+        .build();
+    let f: Foo = config.get("foo").unwrap();
+    assert_eq!(f.inner.value, 12);
+}
+
+#[cargo_test]
 fn overlapping_env_config() {
     // Issue where one key is a prefix of another.
     #[derive(Deserialize)]
@@ -1204,6 +1301,100 @@ fn overlapping_env_config() {
     let s: Ambig = config.get("ambig").unwrap();
     assert_eq!(s.debug_assertions, Some(true));
     assert_eq!(s.debug, Some(1));
+}
+
+#[cargo_test]
+fn overlapping_env_with_defaults_errors_out() {
+    // Issue where one key is a prefix of another.
+    // This is a limitation of mapping environment variables on to a hierarchy.
+    // Check that we error out when we hit ambiguity in this way, rather than
+    // the more-surprising defaulting through.
+    // If, in the future, we can handle this more correctly, feel free to delete
+    // this test.
+    #[derive(Deserialize, Default)]
+    #[serde(default, rename_all = "kebab-case")]
+    struct Ambig {
+        debug: u32,
+        debug_assertions: bool,
+    }
+    let config = ConfigBuilder::new()
+        .env("CARGO_AMBIG_DEBUG_ASSERTIONS", "true")
+        .build();
+    let err = config.get::<Ambig>("ambig").err().unwrap();
+    assert!(format!("{}", err).contains("missing config key `ambig.debug`"));
+
+    let config = ConfigBuilder::new().env("CARGO_AMBIG_DEBUG", "5").build();
+    let s: Ambig = config.get("ambig").unwrap();
+    assert_eq!(s.debug_assertions, bool::default());
+    assert_eq!(s.debug, 5);
+
+    let config = ConfigBuilder::new()
+        .env("CARGO_AMBIG_DEBUG", "1")
+        .env("CARGO_AMBIG_DEBUG_ASSERTIONS", "true")
+        .build();
+    let s: Ambig = config.get("ambig").unwrap();
+    assert_eq!(s.debug_assertions, true);
+    assert_eq!(s.debug, 1);
+}
+
+#[cargo_test]
+fn struct_with_overlapping_inner_struct_and_defaults() {
+    // Struct with serde defaults.
+    // Check that can be defined with environment variable.
+    #[derive(Deserialize, Default)]
+    #[serde(default)]
+    struct Inner {
+        value: i32,
+    }
+
+    // Containing struct with a prefix of inner
+    //
+    // This is a limitation of mapping environment variables on to a hierarchy.
+    // Check that we error out when we hit ambiguity in this way, rather than
+    // the more-surprising defaulting through.
+    // If, in the future, we can handle this more correctly, feel free to delete
+    // this case.
+    #[derive(Deserialize, Default)]
+    #[serde(default)]
+    struct PrefixContainer {
+        inn: bool,
+        inner: Inner,
+    }
+    let config = ConfigBuilder::new()
+        .env("CARGO_PREFIXCONTAINER_INNER_VALUE", "12")
+        .build();
+    let err = config
+        .get::<PrefixContainer>("prefixcontainer")
+        .err()
+        .unwrap();
+    assert!(format!("{}", err).contains("missing config key `prefixcontainer.inn`"));
+    let config = ConfigBuilder::new()
+        .env("CARGO_PREFIXCONTAINER_INNER_VALUE", "12")
+        .env("CARGO_PREFIXCONTAINER_INN", "true")
+        .build();
+    let f: PrefixContainer = config.get("prefixcontainer").unwrap();
+    assert_eq!(f.inner.value, 12);
+    assert_eq!(f.inn, true);
+
+    // Containing struct where the inner value's field is a prefix of another
+    //
+    // This is a limitation of mapping environment variables on to a hierarchy.
+    // Check that we error out when we hit ambiguity in this way, rather than
+    // the more-surprising defaulting through.
+    // If, in the future, we can handle this more correctly, feel free to delete
+    // this case.
+    #[derive(Deserialize, Default)]
+    #[serde(default)]
+    struct InversePrefixContainer {
+        inner_field: bool,
+        inner: Inner,
+    }
+    let config = ConfigBuilder::new()
+        .env("CARGO_INVERSEPREFIXCONTAINER_INNER_VALUE", "12")
+        .build();
+    let f: InversePrefixContainer = config.get("inverseprefixcontainer").unwrap();
+    assert_eq!(f.inner_field, bool::default());
+    assert_eq!(f.inner.value, 12);
 }
 
 #[cargo_test]
@@ -1257,4 +1448,48 @@ fn string_list_advanced_env() {
         config.get::<StringList>("key3").unwrap_err(),
         "error in environment variable `CARGO_KEY3`: expected string, found integer",
     );
+}
+
+#[cargo_test]
+fn parse_strip_with_string() {
+    write_config(
+        "\
+[profile.release]
+strip = 'debuginfo'
+",
+    );
+
+    let config = new_config();
+
+    let p: toml::TomlProfile = config.get("profile.release").unwrap();
+    let strip = p.strip.unwrap();
+    assert_eq!(strip, toml::StringOrBool::String("debuginfo".to_string()));
+}
+
+#[cargo_test]
+fn cargo_target_empty_cfg() {
+    write_config(
+        "\
+[build]
+target-dir = ''
+",
+    );
+
+    let config = new_config();
+
+    assert_error(
+        config.target_dir().unwrap_err(),
+        "the target directory is set to an empty string in [..]/.cargo/config",
+    );
+}
+
+#[cargo_test]
+fn cargo_target_empty_env() {
+    let project = project().build();
+
+    project.cargo("build")
+        .env("CARGO_TARGET_DIR", "")
+        .with_stderr("error: the target directory is set to an empty string in the `CARGO_TARGET_DIR` environment variable")
+        .with_status(101)
+        .run()
 }

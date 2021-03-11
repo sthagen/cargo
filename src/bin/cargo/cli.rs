@@ -1,5 +1,5 @@
 use cargo::core::features;
-use cargo::{self, CliResult, Config};
+use cargo::{self, drop_print, drop_println, CliResult, Config};
 use clap::{AppSettings, Arg, ArgMatches};
 
 use super::commands;
@@ -10,6 +10,11 @@ pub fn main(config: &mut Config) -> CliResult {
     // CAUTION: Be careful with using `config` until it is configured below.
     // In general, try to avoid loading config values unless necessary (like
     // the [alias] table).
+
+    if commands::help::handle_embedded_help(config) {
+        return Ok(());
+    }
+
     let args = match cli().get_matches_safe() {
         Ok(args) => args,
         Err(e) => {
@@ -25,22 +30,27 @@ pub fn main(config: &mut Config) -> CliResult {
     };
 
     if args.value_of("unstable-features") == Some("help") {
-        println!(
+        drop_println!(
+            config,
             "
 Available unstable (nightly-only) flags:
 
-    -Z avoid-dev-deps   -- Avoid installing dev-dependencies if possible
-    -Z minimal-versions -- Install minimal dependency versions instead of maximum
-    -Z no-index-update  -- Do not update the registry, avoids a network request for benchmarking
-    -Z unstable-options -- Allow the usage of unstable options
-    -Z timings          -- Display concurrency information
-    -Z doctest-xcompile -- Compile and run doctests for non-host target using runner config
-    -Z crate-versions   -- Add crate versions to generated docs
+    -Z avoid-dev-deps      -- Avoid installing dev-dependencies if possible
+    -Z extra-link-arg      -- Allow `cargo:rustc-link-arg` in build scripts
+    -Z minimal-versions    -- Install minimal dependency versions instead of maximum
+    -Z no-index-update     -- Do not update the registry, avoids a network request for benchmarking
+    -Z unstable-options    -- Allow the usage of unstable options
+    -Z timings             -- Display concurrency information
+    -Z doctest-xcompile    -- Compile and run doctests for non-host target using runner config
+    -Z terminal-width      -- Provide a terminal width to rustc for error truncation
+    -Z namespaced-features -- Allow features with `dep:` prefix
+    -Z weak-dep-features   -- Allow `dep_name?/feature` feature syntax
 
 Run with 'cargo -Z [FLAG] [SUBCOMMAND]'"
         );
-        if !features::nightly_features_allowed() {
-            println!(
+        if !config.nightly_features_allowed {
+            drop_println!(
+                config,
                 "\nUnstable flags are only available on the nightly channel \
                  of Cargo, but this is the `{}` channel.\n\
                  {}",
@@ -48,7 +58,8 @@ Run with 'cargo -Z [FLAG] [SUBCOMMAND]'"
                 features::SEE_CHANNELS
             );
         }
-        println!(
+        drop_println!(
+            config,
             "\nSee https://doc.rust-lang.org/nightly/cargo/reference/unstable.html \
              for more information about these flags."
         );
@@ -58,7 +69,7 @@ Run with 'cargo -Z [FLAG] [SUBCOMMAND]'"
     let is_verbose = args.occurrences_of("verbose") > 0;
     if args.is_present("version") {
         let version = get_version_string(is_verbose);
-        print!("{}", version);
+        drop_print!(config, "{}", version);
         return Ok(());
     }
 
@@ -69,19 +80,19 @@ Run with 'cargo -Z [FLAG] [SUBCOMMAND]'"
     }
 
     if args.is_present("list") {
-        println!("Installed Commands:");
+        drop_println!(config, "Installed Commands:");
         for command in list_commands(config) {
             match command {
                 CommandInfo::BuiltIn { name, about } => {
                     let summary = about.unwrap_or_default();
                     let summary = summary.lines().next().unwrap_or(&summary); // display only the first line
-                    println!("    {:<20} {}", name, summary)
+                    drop_println!(config, "    {:<20} {}", name, summary);
                 }
                 CommandInfo::External { name, path } => {
                     if is_verbose {
-                        println!("    {:<20} {}", name, path.display())
+                        drop_println!(config, "    {:<20} {}", name, path.display());
                     } else {
-                        println!("    {}", name)
+                        drop_println!(config, "    {}", name);
                     }
                 }
             }
@@ -110,7 +121,7 @@ Run with 'cargo -Z [FLAG] [SUBCOMMAND]'"
 pub fn get_version_string(is_verbose: bool) -> String {
     let version = cargo::version();
     let mut version_string = version.to_string();
-    version_string.push_str("\n");
+    version_string.push('\n');
     if is_verbose {
         version_string.push_str(&format!(
             "release: {}.{}.{}\n",
@@ -179,9 +190,7 @@ fn config_configure(
     let quiet =
         args.is_present("quiet") || subcommand_args.is_present("quiet") || global_args.quiet;
     let global_color = global_args.color; // Extract so it can take reference.
-    let color = args
-        .value_of("color")
-        .or_else(|| global_color.as_ref().map(|s| s.as_ref()));
+    let color = args.value_of("color").or_else(|| global_color.as_deref());
     let frozen = args.is_present("frozen") || global_args.frozen;
     let locked = args.is_present("locked") || global_args.locked;
     let offline = args.is_present("offline") || global_args.offline;
@@ -255,6 +264,12 @@ impl GlobalArgs {
 }
 
 fn cli() -> App {
+    let is_rustup = std::env::var_os("RUSTUP_HOME").is_some();
+    let usage = if is_rustup {
+        "cargo [+toolchain] [OPTIONS] [SUBCOMMAND]"
+    } else {
+        "cargo [OPTIONS] [SUBCOMMAND]"
+    };
     App::new("cargo")
         .settings(&[
             AppSettings::UnifiedHelpMessage,
@@ -262,6 +277,7 @@ fn cli() -> App {
             AppSettings::VersionlessSubcommands,
             AppSettings::AllowExternalSubcommands,
         ])
+        .usage(usage)
         .template(
             "\
 Rust's package manager
@@ -273,14 +289,14 @@ OPTIONS:
 {unified}
 
 Some common cargo commands are (see all commands with --list):
-    build       Compile the current package
-    check       Analyze the current package and report errors, but don't build object files
+    build, b    Compile the current package
+    check, c    Analyze the current package and report errors, but don't build object files
     clean       Remove the target directory
     doc         Build this package's and its dependencies' documentation
     new         Create a new cargo package
     init        Create a new cargo package in an existing directory
-    run         Run a binary or example of the local package
-    test        Run the tests
+    run, r      Run a binary or example of the local package
+    test, t     Run the tests
     bench       Run the benchmarks
     update      Update dependencies listed in Cargo.lock
     search      Search registry for crates
@@ -312,9 +328,12 @@ See 'cargo help <command>' for more information on a specific command.\n",
         .arg(opt("locked", "Require Cargo.lock is up to date").global(true))
         .arg(opt("offline", "Run without accessing the network").global(true))
         .arg(
-            multi_opt("config", "KEY=VALUE", "Override a configuration value")
-                .global(true)
-                .hidden(true),
+            multi_opt(
+                "config",
+                "KEY=VALUE",
+                "Override a configuration value (unstable)",
+            )
+            .global(true),
         )
         .arg(
             Arg::with_name("unstable-features")

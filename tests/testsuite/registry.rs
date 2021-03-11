@@ -1,15 +1,13 @@
 //! Tests for normal registry dependencies.
 
-use std::fs::{self, File};
-use std::io::prelude::*;
-use std::path::Path;
-
-use cargo::util::paths::remove_dir_all;
-use cargo_test_support::cargo_process;
-use cargo_test_support::git;
+use cargo::{core::SourceId, util::paths::remove_dir_all};
 use cargo_test_support::paths::{self, CargoPathExt};
-use cargo_test_support::registry::{self, registry_path, registry_url, Dependency, Package};
-use cargo_test_support::{basic_manifest, project, t};
+use cargo_test_support::registry::{self, registry_path, Dependency, Package};
+use cargo_test_support::{basic_manifest, project};
+use cargo_test_support::{cargo_process, registry::registry_url};
+use cargo_test_support::{git, install::cargo_home, t};
+use std::fs::{self, File};
+use std::path::Path;
 
 #[cargo_test]
 fn simple() {
@@ -17,14 +15,14 @@ fn simple() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "foo"
-            version = "0.0.1"
-            authors = []
+                [project]
+                name = "foo"
+                version = "0.0.1"
+                authors = []
 
-            [dependencies]
-            bar = ">= 0.0.0"
-        "#,
+                [dependencies]
+                bar = ">= 0.0.0"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
@@ -65,14 +63,14 @@ fn deps() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "foo"
-            version = "0.0.1"
-            authors = []
+                [project]
+                name = "foo"
+                version = "0.0.1"
+                authors = []
 
-            [dependencies]
-            bar = ">= 0.0.0"
-        "#,
+                [dependencies]
+                bar = ">= 0.0.0"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
@@ -105,14 +103,14 @@ fn nonexistent() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "foo"
-            version = "0.0.1"
-            authors = []
+                [project]
+                name = "foo"
+                version = "0.0.1"
+                authors = []
 
-            [dependencies]
-            nonexistent = ">= 0.0.0"
-        "#,
+                [dependencies]
+                nonexistent = ">= 0.0.0"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
@@ -138,14 +136,14 @@ fn wrong_case() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "foo"
-            version = "0.0.1"
-            authors = []
+                [project]
+                name = "foo"
+                version = "0.0.1"
+                authors = []
 
-            [dependencies]
-            Init = ">= 0.0.0"
-        "#,
+                [dependencies]
+                Init = ">= 0.0.0"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
@@ -173,14 +171,14 @@ fn mis_hyphenated() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "foo"
-            version = "0.0.1"
-            authors = []
+                [project]
+                name = "foo"
+                version = "0.0.1"
+                authors = []
 
-            [dependencies]
-            mis_hyphenated = ">= 0.0.0"
-        "#,
+                [dependencies]
+                mis_hyphenated = ">= 0.0.0"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
@@ -206,14 +204,14 @@ fn wrong_version() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "foo"
-            version = "0.0.1"
-            authors = []
+                [project]
+                name = "foo"
+                version = "0.0.1"
+                authors = []
 
-            [dependencies]
-            foo = ">= 1.0.0"
-        "#,
+                [dependencies]
+                foo = ">= 1.0.0"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
@@ -225,9 +223,9 @@ fn wrong_version() {
         .with_status(101)
         .with_stderr_contains(
             "\
-error: failed to select a version for the requirement `foo = \">= 1.0.0\"`
-  candidate versions found which didn't match: 0.0.2, 0.0.1
-  location searched: `[..]` index (which is replacing registry `[..]`)
+error: failed to select a version for the requirement `foo = \">=1.0.0\"`
+candidate versions found which didn't match: 0.0.2, 0.0.1
+location searched: `[..]` index (which is replacing registry `[..]`)
 required by package `foo v0.0.1 ([..])`
 ",
         )
@@ -240,9 +238,9 @@ required by package `foo v0.0.1 ([..])`
         .with_status(101)
         .with_stderr_contains(
             "\
-error: failed to select a version for the requirement `foo = \">= 1.0.0\"`
-  candidate versions found which didn't match: 0.0.4, 0.0.3, 0.0.2, ...
-  location searched: `[..]` index (which is replacing registry `[..]`)
+error: failed to select a version for the requirement `foo = \">=1.0.0\"`
+candidate versions found which didn't match: 0.0.4, 0.0.3, 0.0.2, ...
+location searched: `[..]` index (which is replacing registry `[..]`)
 required by package `foo v0.0.1 ([..])`
 ",
         )
@@ -255,14 +253,14 @@ fn bad_cksum() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "foo"
-            version = "0.0.1"
-            authors = []
+                [project]
+                name = "foo"
+                version = "0.0.1"
+                authors = []
 
-            [dependencies]
-            bad-cksum = ">= 0.0.0"
-        "#,
+                [dependencies]
+                bad-cksum = ">= 0.0.0"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
@@ -295,14 +293,14 @@ fn update_registry() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "foo"
-            version = "0.0.1"
-            authors = []
+                [project]
+                name = "foo"
+                version = "0.0.1"
+                authors = []
 
-            [dependencies]
-            notyet = ">= 0.0.0"
-        "#,
+                [dependencies]
+                notyet = ">= 0.0.0"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
@@ -343,31 +341,36 @@ fn package_with_path_deps() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "foo"
-            version = "0.0.1"
-            authors = []
-            license = "MIT"
-            description = "foo"
-            repository = "bar"
+                [project]
+                name = "foo"
+                version = "0.0.1"
+                authors = []
+                license = "MIT"
+                description = "foo"
+                repository = "bar"
 
-            [dependencies.notyet]
-            version = "0.0.1"
-            path = "notyet"
-        "#,
+                [dependencies.notyet]
+                version = "0.0.1"
+                path = "notyet"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .file("notyet/Cargo.toml", &basic_manifest("notyet", "0.0.1"))
         .file("notyet/src/lib.rs", "")
         .build();
 
-    p.cargo("package -v")
+    p.cargo("package")
         .with_status(101)
         .with_stderr_contains(
             "\
-[ERROR] no matching package named `notyet` found
-location searched: registry [..]
-required by package `foo v0.0.1 ([..])`
+[PACKAGING] foo [..]
+[UPDATING] [..]
+[ERROR] failed to prepare local package for uploading
+
+Caused by:
+  no matching package named `notyet` found
+  location searched: registry `https://github.com/rust-lang/crates.io-index`
+  required by package `foo v0.0.1 [..]`
 ",
         )
         .run();
@@ -377,8 +380,8 @@ required by package `foo v0.0.1 ([..])`
     p.cargo("package")
         .with_stderr(
             "\
-[UPDATING] `[..]` index
 [PACKAGING] foo v0.0.1 ([CWD])
+[UPDATING] `[..]` index
 [VERIFYING] foo v0.0.1 ([CWD])
 [DOWNLOADING] crates ...
 [DOWNLOADED] notyet v0.0.1 (registry `[ROOT][..]`)
@@ -396,14 +399,14 @@ fn lockfile_locks() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "foo"
-            version = "0.0.1"
-            authors = []
+                [project]
+                name = "foo"
+                version = "0.0.1"
+                authors = []
 
-            [dependencies]
-            bar = "*"
-        "#,
+                [dependencies]
+                bar = "*"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
@@ -435,14 +438,14 @@ fn lockfile_locks_transitively() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "foo"
-            version = "0.0.1"
-            authors = []
+                [project]
+                name = "foo"
+                version = "0.0.1"
+                authors = []
 
-            [dependencies]
-            bar = "*"
-        "#,
+                [dependencies]
+                bar = "*"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
@@ -478,14 +481,14 @@ fn yanks_are_not_used() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "foo"
-            version = "0.0.1"
-            authors = []
+                [project]
+                name = "foo"
+                version = "0.0.1"
+                authors = []
 
-            [dependencies]
-            bar = "*"
-        "#,
+                [dependencies]
+                bar = "*"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
@@ -520,14 +523,14 @@ fn relying_on_a_yank_is_bad() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "foo"
-            version = "0.0.1"
-            authors = []
+                [project]
+                name = "foo"
+                version = "0.0.1"
+                authors = []
 
-            [dependencies]
-            bar = "*"
-        "#,
+                [dependencies]
+                bar = "*"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
@@ -540,9 +543,9 @@ fn relying_on_a_yank_is_bad() {
         .with_status(101)
         .with_stderr_contains(
             "\
-error: failed to select a version for the requirement `baz = \"= 0.0.2\"`
-  candidate versions found which didn't match: 0.0.1
-  location searched: `[..]` index (which is replacing registry `[..]`)
+error: failed to select a version for the requirement `baz = \"=0.0.2\"`
+candidate versions found which didn't match: 0.0.1
+location searched: `[..]` index (which is replacing registry `[..]`)
 required by package `bar v0.0.1`
     ... which is depended on by `foo [..]`
 ",
@@ -556,14 +559,14 @@ fn yanks_in_lockfiles_are_ok() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "foo"
-            version = "0.0.1"
-            authors = []
+                [project]
+                name = "foo"
+                version = "0.0.1"
+                authors = []
 
-            [dependencies]
-            bar = "*"
-        "#,
+                [dependencies]
+                bar = "*"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
@@ -596,15 +599,15 @@ fn yanks_in_lockfiles_are_ok_for_other_update() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "foo"
-            version = "0.0.1"
-            authors = []
+                [project]
+                name = "foo"
+                version = "0.0.1"
+                authors = []
 
-            [dependencies]
-            bar = "*"
-            baz = "*"
-        "#,
+                [dependencies]
+                bar = "*"
+                baz = "*"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
@@ -650,14 +653,14 @@ fn yanks_in_lockfiles_are_ok_with_new_dep() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "foo"
-            version = "0.0.1"
-            authors = []
+                [project]
+                name = "foo"
+                version = "0.0.1"
+                authors = []
 
-            [dependencies]
-            bar = "*"
-        "#,
+                [dependencies]
+                bar = "*"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
@@ -671,8 +674,9 @@ fn yanks_in_lockfiles_are_ok_with_new_dep() {
     Package::new("bar", "0.0.1").yanked(true).publish();
     Package::new("baz", "0.0.1").publish();
 
-    t!(t!(File::create(p.root().join("Cargo.toml"))).write_all(
-        br#"
+    p.change_file(
+        "Cargo.toml",
+        r#"
             [project]
             name = "foo"
             version = "0.0.1"
@@ -681,8 +685,8 @@ fn yanks_in_lockfiles_are_ok_with_new_dep() {
             [dependencies]
             bar = "*"
             baz = "*"
-    "#
-    ));
+        "#,
+    );
 
     p.cargo("build").with_stdout("").run();
 }
@@ -693,14 +697,14 @@ fn update_with_lockfile_if_packages_missing() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "foo"
-            version = "0.0.1"
-            authors = []
+                [project]
+                name = "foo"
+                version = "0.0.1"
+                authors = []
 
-            [dependencies]
-            bar = "*"
-        "#,
+                [dependencies]
+                bar = "*"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
@@ -728,14 +732,14 @@ fn update_lockfile() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "foo"
-            version = "0.0.1"
-            authors = []
+                [project]
+                name = "foo"
+                version = "0.0.1"
+                authors = []
 
-            [dependencies]
-            bar = "*"
-        "#,
+                [dependencies]
+                bar = "*"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
@@ -825,14 +829,14 @@ fn dev_dependency_not_used() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "foo"
-            version = "0.0.1"
-            authors = []
+                [project]
+                name = "foo"
+                version = "0.0.1"
+                authors = []
 
-            [dependencies]
-            bar = "*"
-        "#,
+                [dependencies]
+                bar = "*"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
@@ -886,19 +890,18 @@ fn bad_license_file() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "foo"
-            version = "0.0.1"
-            authors = []
-            license-file = "foo"
-            description = "bar"
-            repository = "baz"
-        "#,
+                [project]
+                name = "foo"
+                version = "0.0.1"
+                authors = []
+                license-file = "foo"
+                description = "bar"
+                repository = "baz"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
-    p.cargo("publish -v --index")
-        .arg(registry_url().to_string())
+    p.cargo("publish -v --token sekrit")
         .with_status(101)
         .with_stderr_contains("[ERROR] the license file `foo` does not exist")
         .run();
@@ -910,27 +913,27 @@ fn updating_a_dep() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "foo"
-            version = "0.0.1"
-            authors = []
+                [project]
+                name = "foo"
+                version = "0.0.1"
+                authors = []
 
-            [dependencies.a]
-            path = "a"
-        "#,
+                [dependencies.a]
+                path = "a"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .file(
             "a/Cargo.toml",
             r#"
-            [project]
-            name = "a"
-            version = "0.0.1"
-            authors = []
+                [project]
+                name = "a"
+                version = "0.0.1"
+                authors = []
 
-            [dependencies]
-            bar = "*"
-        "#,
+                [dependencies]
+                bar = "*"
+            "#,
         )
         .file("a/src/lib.rs", "")
         .build();
@@ -951,8 +954,9 @@ fn updating_a_dep() {
         )
         .run();
 
-    t!(t!(File::create(&p.root().join("a/Cargo.toml"))).write_all(
-        br#"
+    p.change_file(
+        "a/Cargo.toml",
+        r#"
         [project]
         name = "a"
         version = "0.0.1"
@@ -960,8 +964,8 @@ fn updating_a_dep() {
 
         [dependencies]
         bar = "0.1.0"
-    "#
-    ));
+        "#,
+    );
     Package::new("bar", "0.1.0").publish();
 
     println!("second");
@@ -986,14 +990,14 @@ fn git_and_registry_dep() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "b"
-            version = "0.0.1"
-            authors = []
+                [project]
+                name = "b"
+                version = "0.0.1"
+                authors = []
 
-            [dependencies]
-            a = "0.0.1"
-        "#,
+                [dependencies]
+                a = "0.0.1"
+            "#,
         )
         .file("src/lib.rs", "")
         .build();
@@ -1002,17 +1006,17 @@ fn git_and_registry_dep() {
             "Cargo.toml",
             &format!(
                 r#"
-            [project]
-            name = "foo"
-            version = "0.0.1"
-            authors = []
+                    [project]
+                    name = "foo"
+                    version = "0.0.1"
+                    authors = []
 
-            [dependencies]
-            a = "0.0.1"
+                    [dependencies]
+                    a = "0.0.1"
 
-            [dependencies.b]
-            git = '{}'
-        "#,
+                    [dependencies.b]
+                    git = '{}'
+                "#,
                 b.url()
             ),
         )
@@ -1050,14 +1054,14 @@ fn update_publish_then_update() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "foo"
-            version = "0.5.0"
-            authors = []
+                [project]
+                name = "foo"
+                version = "0.5.0"
+                authors = []
 
-            [dependencies]
-            a = "0.1.0"
-        "#,
+                [dependencies]
+                a = "0.1.0"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
@@ -1078,14 +1082,14 @@ fn update_publish_then_update() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "foo"
-            version = "0.5.0"
-            authors = []
+                [project]
+                name = "foo"
+                version = "0.5.0"
+                authors = []
 
-            [dependencies]
-            a = "0.1.1"
-        "#,
+                [dependencies]
+                a = "0.1.1"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
@@ -1120,14 +1124,14 @@ fn fetch_downloads() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "foo"
-            version = "0.5.0"
-            authors = []
+                [project]
+                name = "foo"
+                version = "0.5.0"
+                authors = []
 
-            [dependencies]
-            a = "0.1.0"
-        "#,
+                [dependencies]
+                a = "0.1.0"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
@@ -1151,14 +1155,14 @@ fn update_transitive_dependency() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "foo"
-            version = "0.5.0"
-            authors = []
+                [project]
+                name = "foo"
+                version = "0.5.0"
+                authors = []
 
-            [dependencies]
-            a = "0.1.0"
-        "#,
+                [dependencies]
+                a = "0.1.0"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
@@ -1199,14 +1203,14 @@ fn update_backtracking_ok() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "foo"
-            version = "0.5.0"
-            authors = []
+                [project]
+                name = "foo"
+                version = "0.5.0"
+                authors = []
 
-            [dependencies]
-            webdriver = "0.1"
-        "#,
+                [dependencies]
+                webdriver = "0.1"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
@@ -1248,16 +1252,16 @@ fn update_multiple_packages() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "foo"
-            version = "0.5.0"
-            authors = []
+                [project]
+                name = "foo"
+                version = "0.5.0"
+                authors = []
 
-            [dependencies]
-            a = "*"
-            b = "*"
-            c = "*"
-        "#,
+                [dependencies]
+                a = "*"
+                b = "*"
+                c = "*"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
@@ -1308,15 +1312,15 @@ fn bundled_crate_in_registry() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "foo"
-            version = "0.5.0"
-            authors = []
+                [project]
+                name = "foo"
+                version = "0.5.0"
+                authors = []
 
-            [dependencies]
-            bar = "0.1"
-            baz = "0.1"
-        "#,
+                [dependencies]
+                bar = "0.1"
+                baz = "0.1"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
@@ -1327,14 +1331,14 @@ fn bundled_crate_in_registry() {
         .file(
             "Cargo.toml",
             r#"
-            [package]
-            name = "baz"
-            version = "0.1.0"
-            authors = []
+                [package]
+                name = "baz"
+                version = "0.1.0"
+                authors = []
 
-            [dependencies]
-            bar = { path = "bar", version = "0.1.0" }
-        "#,
+                [dependencies]
+                bar = { path = "bar", version = "0.1.0" }
+            "#,
         )
         .file("src/lib.rs", "")
         .file("bar/Cargo.toml", &basic_manifest("bar", "0.1.0"))
@@ -1350,14 +1354,14 @@ fn update_same_prefix_oh_my_how_was_this_a_bug() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "ugh"
-            version = "0.5.0"
-            authors = []
+                [project]
+                name = "ugh"
+                version = "0.5.0"
+                authors = []
 
-            [dependencies]
-            foo = "0.1"
-        "#,
+                [dependencies]
+                foo = "0.1"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
@@ -1377,14 +1381,14 @@ fn use_semver() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "bar"
-            version = "0.5.0"
-            authors = []
+                [project]
+                name = "bar"
+                version = "0.5.0"
+                authors = []
 
-            [dependencies]
-            foo = "1.2.3-alpha.0"
-        "#,
+                [dependencies]
+                foo = "1.2.3-alpha.0"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
@@ -1449,18 +1453,18 @@ fn only_download_relevant() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "bar"
-            version = "0.5.0"
-            authors = []
+                [project]
+                name = "bar"
+                version = "0.5.0"
+                authors = []
 
-            [target.foo.dependencies]
-            foo = "*"
-            [dev-dependencies]
-            bar = "*"
-            [dependencies]
-            baz = "*"
-        "#,
+                [target.foo.dependencies]
+                foo = "*"
+                [dev-dependencies]
+                bar = "*"
+                [dependencies]
+                baz = "*"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
@@ -1489,14 +1493,14 @@ fn resolve_and_backtracking() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "bar"
-            version = "0.5.0"
-            authors = []
+                [project]
+                name = "bar"
+                version = "0.5.0"
+                authors = []
 
-            [dependencies]
-            foo = "*"
-        "#,
+                [dependencies]
+                foo = "*"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
@@ -1515,14 +1519,14 @@ fn upstream_warnings_on_extra_verbose() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "bar"
-            version = "0.5.0"
-            authors = []
+                [project]
+                name = "bar"
+                version = "0.5.0"
+                authors = []
 
-            [dependencies]
-            foo = "*"
-        "#,
+                [dependencies]
+                foo = "*"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
@@ -1542,14 +1546,14 @@ fn disallow_network() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "bar"
-            version = "0.5.0"
-            authors = []
+                [project]
+                name = "bar"
+                version = "0.5.0"
+                authors = []
 
-            [dependencies]
-            foo = "*"
-        "#,
+                [dependencies]
+                foo = "*"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
@@ -1558,7 +1562,10 @@ fn disallow_network() {
         .with_status(101)
         .with_stderr(
             "\
-error: failed to load source for a dependency on `foo`
+[ERROR] failed to get `foo` as a dependency of package `bar v0.5.0 [..]`
+
+Caused by:
+  failed to load source for dependency `foo`
 
 Caused by:
   Unable to update registry [..]
@@ -1576,27 +1583,27 @@ fn add_dep_dont_update_registry() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "bar"
-            version = "0.5.0"
-            authors = []
+                [project]
+                name = "bar"
+                version = "0.5.0"
+                authors = []
 
-            [dependencies]
-            baz = { path = "baz" }
-        "#,
+                [dependencies]
+                baz = { path = "baz" }
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .file(
             "baz/Cargo.toml",
             r#"
-            [project]
-            name = "baz"
-            version = "0.5.0"
-            authors = []
+                [project]
+                name = "baz"
+                version = "0.5.0"
+                authors = []
 
-            [dependencies]
-            remote = "0.3"
-        "#,
+                [dependencies]
+                remote = "0.3"
+            "#,
         )
         .file("baz/src/lib.rs", "")
         .build();
@@ -1605,8 +1612,9 @@ fn add_dep_dont_update_registry() {
 
     p.cargo("build").run();
 
-    t!(t!(File::create(p.root().join("Cargo.toml"))).write_all(
-        br#"
+    p.change_file(
+        "Cargo.toml",
+        r#"
         [project]
         name = "bar"
         version = "0.5.0"
@@ -1615,8 +1623,8 @@ fn add_dep_dont_update_registry() {
         [dependencies]
         baz = { path = "baz" }
         remote = "0.3"
-    "#
-    ));
+        "#,
+    );
 
     p.cargo("build")
         .with_stderr(
@@ -1634,27 +1642,27 @@ fn bump_version_dont_update_registry() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "bar"
-            version = "0.5.0"
-            authors = []
+                [project]
+                name = "bar"
+                version = "0.5.0"
+                authors = []
 
-            [dependencies]
-            baz = { path = "baz" }
-        "#,
+                [dependencies]
+                baz = { path = "baz" }
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .file(
             "baz/Cargo.toml",
             r#"
-            [project]
-            name = "baz"
-            version = "0.5.0"
-            authors = []
+                [project]
+                name = "baz"
+                version = "0.5.0"
+                authors = []
 
-            [dependencies]
-            remote = "0.3"
-        "#,
+                [dependencies]
+                remote = "0.3"
+            "#,
         )
         .file("baz/src/lib.rs", "")
         .build();
@@ -1663,8 +1671,9 @@ fn bump_version_dont_update_registry() {
 
     p.cargo("build").run();
 
-    t!(t!(File::create(p.root().join("Cargo.toml"))).write_all(
-        br#"
+    p.change_file(
+        "Cargo.toml",
+        r#"
         [project]
         name = "bar"
         version = "0.6.0"
@@ -1672,8 +1681,8 @@ fn bump_version_dont_update_registry() {
 
         [dependencies]
         baz = { path = "baz" }
-    "#
-    ));
+        "#,
+    );
 
     p.cargo("build")
         .with_stderr(
@@ -1691,14 +1700,14 @@ fn old_version_req() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "bar"
-            version = "0.5.0"
-            authors = []
+                [project]
+                name = "bar"
+                version = "0.5.0"
+                authors = []
 
-            [dependencies]
-            remote = "0.2*"
-        "#,
+                [dependencies]
+                remote = "0.2*"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
@@ -1745,14 +1754,14 @@ fn old_version_req_upstream() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "bar"
-            version = "0.5.0"
-            authors = []
+                [project]
+                name = "bar"
+                version = "0.5.0"
+                authors = []
 
-            [dependencies]
-            remote = "0.3"
-        "#,
+                [dependencies]
+                remote = "0.3"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
@@ -1822,14 +1831,14 @@ fn toml_lies_but_index_is_truth() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "bar"
-            version = "0.5.0"
-            authors = []
+                [project]
+                name = "bar"
+                version = "0.5.0"
+                authors = []
 
-            [dependencies]
-            bar = "0.3"
-        "#,
+                [dependencies]
+                bar = "0.3"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
@@ -1850,14 +1859,14 @@ fn vv_prints_warnings() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "fo"
-            version = "0.5.0"
-            authors = []
+                [project]
+                name = "fo"
+                version = "0.5.0"
+                authors = []
 
-            [dependencies]
-            foo = "0.2"
-        "#,
+                [dependencies]
+                foo = "0.2"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
@@ -1875,14 +1884,14 @@ fn bad_and_or_malicious_packages_rejected() {
         .file(
             "Cargo.toml",
             r#"
-            [project]
-            name = "fo"
-            version = "0.5.0"
-            authors = []
+                [project]
+                name = "fo"
+                version = "0.5.0"
+                authors = []
 
-            [dependencies]
-            foo = "0.2"
-        "#,
+                [dependencies]
+                foo = "0.2"
+            "#,
         )
         .file("src/main.rs", "fn main() {}")
         .build();
@@ -1930,15 +1939,14 @@ fn git_init_templatedir_missing() {
     p.cargo("build").run();
 
     remove_dir_all(paths::home().join(".cargo/registry")).unwrap();
-    File::create(paths::home().join(".gitconfig"))
-        .unwrap()
-        .write_all(
-            br#"
+    fs::write(
+        paths::home().join(".gitconfig"),
+        r#"
             [init]
             templatedir = nowhere
         "#,
-        )
-        .unwrap();
+    )
+    .unwrap();
 
     p.cargo("build").run();
     p.cargo("build").run();
@@ -2074,4 +2082,121 @@ fn readonly_registry_still_works() {
         perms.set_readonly(readonly);
         t!(fs::set_permissions(path, perms));
     }
+}
+
+#[cargo_test]
+fn registry_index_rejected() {
+    Package::new("dep", "0.1.0").publish();
+
+    let p = project()
+        .file(
+            ".cargo/config",
+            r#"
+            [registry]
+            index = "https://example.com/"
+            "#,
+        )
+        .file(
+            "Cargo.toml",
+            r#"
+            [package]
+            name = "foo"
+            version = "0.1.0"
+
+            [dependencies]
+            dep = "0.1"
+            "#,
+        )
+        .file("src/lib.rs", "")
+        .build();
+
+    p.cargo("check")
+        .with_status(101)
+        .with_stderr(
+            "\
+[ERROR] failed to parse manifest at `[..]/foo/Cargo.toml`
+
+Caused by:
+  the `registry.index` config value is no longer supported
+  Use `[source]` replacement to alter the default index for crates.io.
+",
+        )
+        .run();
+
+    p.cargo("login")
+        .with_status(101)
+        .with_stderr(
+            "\
+[ERROR] the `registry.index` config value is no longer supported
+Use `[source]` replacement to alter the default index for crates.io.
+",
+        )
+        .run();
+}
+
+#[cargo_test]
+fn package_lock_inside_package_is_overwritten() {
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [project]
+                name = "foo"
+                version = "0.0.1"
+                authors = []
+
+                [dependencies]
+                bar = ">= 0.0.0"
+            "#,
+        )
+        .file("src/main.rs", "fn main() {}")
+        .build();
+
+    Package::new("bar", "0.0.1")
+        .file("src/lib.rs", "")
+        .file(".cargo-ok", "")
+        .publish();
+
+    p.cargo("build").run();
+
+    let id = SourceId::for_registry(&registry_url()).unwrap();
+    let hash = cargo::util::hex::short_hash(&id);
+    let ok = cargo_home()
+        .join("registry")
+        .join("src")
+        .join(format!("-{}", hash))
+        .join("bar-0.0.1")
+        .join(".cargo-ok");
+
+    assert_eq!(ok.metadata().unwrap().len(), 2);
+}
+
+#[cargo_test]
+fn ignores_unknown_index_version() {
+    // If the version field is not understood, it is ignored.
+    Package::new("bar", "1.0.0").publish();
+    Package::new("bar", "1.0.1").schema_version(9999).publish();
+
+    let p = project()
+        .file(
+            "Cargo.toml",
+            r#"
+                [package]
+                name = "foo"
+                version = "0.1.0"
+
+                [dependencies]
+                bar = "1.0"
+            "#,
+        )
+        .file("src/lib.rs", "")
+        .build();
+
+    p.cargo("tree")
+        .with_stdout(
+            "foo v0.1.0 [..]\n\
+             └── bar v1.0.0\n\
+            ",
+        )
+        .run();
 }

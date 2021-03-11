@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
+use std::iter::once;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
@@ -275,9 +276,9 @@ impl ProcessBuilder {
         })()
         .chain_err(|| process_error(&format!("could not execute process {}", self), None, None))?;
         let output = Output {
+            status,
             stdout,
             stderr,
-            status,
         };
 
         {
@@ -326,6 +327,37 @@ impl ProcessBuilder {
         }
         command
     }
+
+    /// Wraps an existing command with the provided wrapper, if it is present and valid.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use cargo::util::{ProcessBuilder, process};
+    /// // Running this would execute `rustc`
+    /// let cmd: ProcessBuilder = process("rustc");
+    ///
+    /// // Running this will execute `sccache rustc`
+    /// let cmd = cmd.wrapped(Some("sccache"));
+    /// ```
+    pub fn wrapped(mut self, wrapper: Option<impl AsRef<OsStr>>) -> Self {
+        let wrapper = if let Some(wrapper) = wrapper.as_ref() {
+            wrapper.as_ref()
+        } else {
+            return self;
+        };
+
+        if wrapper.is_empty() {
+            return self;
+        }
+
+        let args = once(self.program).chain(self.args.into_iter()).collect();
+
+        self.program = wrapper.to_os_string();
+        self.args = args;
+
+        self
+    }
 }
 
 /// A helper function to create a `ProcessBuilder`.
@@ -349,13 +381,11 @@ mod imp {
     pub fn exec_replace(process_builder: &ProcessBuilder) -> CargoResult<()> {
         let mut command = process_builder.build_command();
         let error = command.exec();
-        Err(anyhow::Error::from(error)
-            .context(process_error(
-                &format!("could not execute process {}", process_builder),
-                None,
-                None,
-            ))
-            .into())
+        Err(anyhow::Error::from(error).context(process_error(
+            &format!("could not execute process {}", process_builder),
+            None,
+            None,
+        )))
     }
 }
 

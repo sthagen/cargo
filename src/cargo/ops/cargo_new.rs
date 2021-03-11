@@ -1,7 +1,7 @@
-use crate::core::{compiler, Workspace};
+use crate::core::{Edition, Shell, Workspace};
 use crate::util::errors::{CargoResult, CargoResultExt};
 use crate::util::{existing_vcs_repo, FossilRepo, GitRepo, HgRepo, PijulRepo};
-use crate::util::{paths, validate_package_name, Config};
+use crate::util::{paths, restricted_names, Config};
 use git2::Config as GitConfig;
 use git2::Repository as GitRepository;
 use serde::de;
@@ -9,7 +9,6 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
-use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -155,41 +154,103 @@ fn get_name<'a>(path: &'a Path, opts: &'a NewOptions) -> CargoResult<&'a str> {
     })
 }
 
-fn check_name(name: &str, opts: &NewOptions) -> CargoResult<()> {
+fn check_name(
+    name: &str,
+    show_name_help: bool,
+    has_bin: bool,
+    shell: &mut Shell,
+) -> CargoResult<()> {
     // If --name is already used to override, no point in suggesting it
     // again as a fix.
-    let name_help = match opts.name {
-        Some(_) => "",
-        None => "\nuse --name to override crate name",
+    let name_help = if show_name_help {
+        "\nIf you need a package name to not match the directory name, consider using --name flag."
+    } else {
+        ""
     };
+    let bin_help = || {
+        let mut help = String::from(name_help);
+        if has_bin {
+            help.push_str(&format!(
+                "\n\
+                If you need a binary with the name \"{name}\", use a valid package \
+                name, and set the binary name to be different from the package. \
+                This can be done by setting the binary filename to `src/bin/{name}.rs` \
+                or change the name in Cargo.toml with:\n\
+                \n    \
+                [bin]\n    \
+                name = \"{name}\"\n    \
+                path = \"src/main.rs\"\n\
+            ",
+                name = name
+            ));
+        }
+        help
+    };
+    restricted_names::validate_package_name(name, "package name", &bin_help())?;
 
-    // Ban keywords + test list found at
-    // https://doc.rust-lang.org/grammar.html#keywords
-    let blacklist = [
-        "abstract", "alignof", "as", "become", "box", "break", "const", "continue", "crate", "do",
-        "else", "enum", "extern", "false", "final", "fn", "for", "if", "impl", "in", "let", "loop",
-        "macro", "match", "mod", "move", "mut", "offsetof", "override", "priv", "proc", "pub",
-        "pure", "ref", "return", "self", "sizeof", "static", "struct", "super", "test", "trait",
-        "true", "type", "typeof", "unsafe", "unsized", "use", "virtual", "where", "while", "yield",
-    ];
-    if blacklist.contains(&name) || (opts.kind.is_bin() && compiler::is_bad_artifact_name(name)) {
+    if restricted_names::is_keyword(name) {
         anyhow::bail!(
-            "The name `{}` cannot be used as a crate name{}",
+            "the name `{}` cannot be used as a package name, it is a Rust keyword{}",
             name,
-            name_help
-        )
+            bin_help()
+        );
     }
-
-    if let Some(ref c) = name.chars().next() {
-        if c.is_digit(10) {
+    if restricted_names::is_conflicting_artifact_name(name) {
+        if has_bin {
             anyhow::bail!(
-                "Package names starting with a digit cannot be used as a crate name{}",
+                "the name `{}` cannot be used as a package name, \
+                it conflicts with cargo's build directory names{}",
+                name,
                 name_help
-            )
+            );
+        } else {
+            shell.warn(format!(
+                "the name `{}` will not support binary \
+                executables with that name, \
+                it conflicts with cargo's build directory names",
+                name
+            ))?;
         }
     }
+    if name == "test" {
+        anyhow::bail!(
+            "the name `test` cannot be used as a package name, \
+            it conflicts with Rust's built-in test library{}",
+            bin_help()
+        );
+    }
+    if ["core", "std", "alloc", "proc_macro", "proc-macro"].contains(&name) {
+        shell.warn(format!(
+            "the name `{}` is part of Rust's standard library\n\
+            It is recommended to use a different name to avoid problems.{}",
+            name,
+            bin_help()
+        ))?;
+    }
+    if restricted_names::is_windows_reserved(name) {
+        if cfg!(windows) {
+            anyhow::bail!(
+                "cannot use name `{}`, it is a reserved Windows filename{}",
+                name,
+                name_help
+            );
+        } else {
+            shell.warn(format!(
+                "the name `{}` is a reserved Windows filename\n\
+                This package will not work on Windows platforms.",
+                name
+            ))?;
+        }
+    }
+    if restricted_names::is_non_ascii_name(name) {
+        shell.warn(format!(
+            "the name `{}` contains non-ASCII characters\n\
+            Support for non-ASCII crate names is experimental and only valid \
+            on the nightly toolchain.",
+            name
+        ))?;
+    }
 
-    validate_package_name(name, "crate name", name_help)?;
     Ok(())
 }
 
@@ -243,10 +304,7 @@ fn detect_source_paths_and_types(
         let pp = i.proposed_path;
 
         // path/pp does not exist or is not a file
-        if !fs::metadata(&path.join(&pp))
-            .map(|x| x.is_file())
-            .unwrap_or(false)
-        {
+        if !path.join(&pp).is_file() {
             continue;
         }
 
@@ -328,7 +386,7 @@ fn plan_new_source_file(bin: bool, package_name: String) -> SourceFileInformatio
 
 pub fn new(opts: &NewOptions, config: &Config) -> CargoResult<()> {
     let path = &opts.path;
-    if fs::metadata(path).is_ok() {
+    if path.exists() {
         anyhow::bail!(
             "destination `{}` already exists\n\n\
              Use `cargo init` to initialize the directory",
@@ -337,7 +395,12 @@ pub fn new(opts: &NewOptions, config: &Config) -> CargoResult<()> {
     }
 
     let name = get_name(path, opts)?;
-    check_name(name, opts)?;
+    check_name(
+        name,
+        opts.name.is_none(),
+        opts.kind.is_bin(),
+        &mut config.shell(),
+    )?;
 
     let mkopts = MkOptions {
         version_control: opts.version_control,
@@ -345,8 +408,8 @@ pub fn new(opts: &NewOptions, config: &Config) -> CargoResult<()> {
         name,
         source_files: vec![plan_new_source_file(opts.kind.is_bin(), name.to_string())],
         bin: opts.kind.is_bin(),
-        edition: opts.edition.as_ref().map(|s| &**s),
-        registry: opts.registry.as_ref().map(|s| &**s),
+        edition: opts.edition.as_deref(),
+        registry: opts.registry.as_deref(),
     };
 
     mk(config, &mkopts).chain_err(|| {
@@ -367,12 +430,11 @@ pub fn init(opts: &NewOptions, config: &Config) -> CargoResult<()> {
 
     let path = &opts.path;
 
-    if fs::metadata(&path.join("Cargo.toml")).is_ok() {
+    if path.join("Cargo.toml").exists() {
         anyhow::bail!("`cargo init` cannot be run on existing Cargo packages")
     }
 
     let name = get_name(path, opts)?;
-    check_name(name, opts)?;
 
     let mut src_paths_types = vec![];
 
@@ -385,28 +447,30 @@ pub fn init(opts: &NewOptions, config: &Config) -> CargoResult<()> {
         // Maybe when doing `cargo init --bin` inside a library package stub,
         // user may mean "initialize for library, but also add binary target"
     }
+    let has_bin = src_paths_types.iter().any(|x| x.bin);
+    check_name(name, opts.name.is_none(), has_bin, &mut config.shell())?;
 
     let mut version_control = opts.version_control;
 
     if version_control == None {
         let mut num_detected_vsces = 0;
 
-        if fs::metadata(&path.join(".git")).is_ok() {
+        if path.join(".git").exists() {
             version_control = Some(VersionControl::Git);
             num_detected_vsces += 1;
         }
 
-        if fs::metadata(&path.join(".hg")).is_ok() {
+        if path.join(".hg").exists() {
             version_control = Some(VersionControl::Hg);
             num_detected_vsces += 1;
         }
 
-        if fs::metadata(&path.join(".pijul")).is_ok() {
+        if path.join(".pijul").exists() {
             version_control = Some(VersionControl::Pijul);
             num_detected_vsces += 1;
         }
 
-        if fs::metadata(&path.join(".fossil")).is_ok() {
+        if path.join(".fossil").exists() {
             version_control = Some(VersionControl::Fossil);
             num_detected_vsces += 1;
         }
@@ -426,10 +490,10 @@ pub fn init(opts: &NewOptions, config: &Config) -> CargoResult<()> {
         version_control,
         path,
         name,
-        bin: src_paths_types.iter().any(|x| x.bin),
+        bin: has_bin,
         source_files: src_paths_types,
-        edition: opts.edition.as_ref().map(|s| &**s),
-        registry: opts.registry.as_ref().map(|s| &**s),
+        edition: opts.edition.as_deref(),
+        registry: opts.registry.as_deref(),
     };
 
     mk(config, &mkopts).chain_err(|| {
@@ -491,12 +555,12 @@ impl IgnoreList {
             _ => &self.ignore,
         };
 
-        let mut out = "\n\n#Added by cargo\n".to_string();
+        let mut out = "\n\n# Added by cargo\n".to_string();
         if ignore_items
             .iter()
             .any(|item| existing_items.contains(item))
         {
-            out.push_str("#\n#already existing elements were commented out\n");
+            out.push_str("#\n# already existing elements were commented out\n");
         }
         out.push('\n');
 
@@ -528,10 +592,10 @@ fn write_ignore_file(
         VersionControl::NoVcs => return Ok("".to_string()),
     };
 
-    let ignore: String = match fs::File::open(&fp_ignore) {
-        Err(why) => match why.kind() {
-            ErrorKind::NotFound => list.format_new(vcs),
-            _ => return Err(anyhow::format_err!("{}", why)),
+    let ignore: String = match paths::open(&fp_ignore) {
+        Err(err) => match err.downcast_ref::<std::io::Error>() {
+            Some(io_err) if io_err.kind() == ErrorKind::NotFound => list.format_new(vcs),
+            _ => return Err(err),
         },
         Ok(file) => list.format_existing(BufReader::new(file), vcs),
     };
@@ -601,19 +665,30 @@ fn mk(config: &Config, opts: &MkOptions<'_>) -> CargoResult<()> {
     init_vcs(path, vcs, config)?;
     write_ignore_file(path, &ignore, vcs)?;
 
-    let (author_name, email) = discover_author()?;
-    let author = match (cfg.name, cfg.email, author_name, email) {
-        (Some(name), Some(email), _, _)
-        | (Some(name), None, _, Some(email))
-        | (None, Some(email), name, _)
-        | (None, None, name, Some(email)) => {
+    let (discovered_name, discovered_email) = discover_author(path);
+
+    // "Name <email>" or "Name" or "<email>" or None if neither name nor email is obtained
+    // cfg takes priority over the discovered ones
+    let author_name = cfg.name.or(discovered_name);
+    let author_email = cfg.email.or(discovered_email);
+
+    let author = match (author_name, author_email) {
+        (Some(name), Some(email)) => {
             if email.is_empty() {
-                name
+                Some(name)
             } else {
-                format!("{} <{}>", name, email)
+                Some(format!("{} <{}>", name, email))
             }
         }
-        (Some(name), None, _, None) | (None, None, name, None) => name,
+        (Some(name), None) => Some(name),
+        (None, Some(email)) => {
+            if email.is_empty() {
+                None
+            } else {
+                Some(format!("<{}>", email))
+            }
+        }
+        (None, None) => None,
     };
 
     let mut cargotoml_path_specifier = String::new();
@@ -662,10 +737,13 @@ edition = {}
 [dependencies]
 {}"#,
             name,
-            toml::Value::String(author),
+            match author {
+                Some(value) => format!("{}", toml::Value::String(value)),
+                None => format!(""),
+            },
             match opts.edition {
                 Some(edition) => toml::Value::String(edition.to_string()),
-                None => toml::Value::String("2018".to_string()),
+                None => toml::Value::String(Edition::LATEST_STABLE.to_string()),
             },
             match opts.registry {
                 Some(registry) => format!(
@@ -706,10 +784,7 @@ mod tests {
 "
         };
 
-        if !fs::metadata(&path_of_source_file)
-            .map(|x| x.is_file())
-            .unwrap_or(false)
-        {
+        if !path_of_source_file.is_file() {
             paths::write(&path_of_source_file, default_file_content)?;
 
             // Format the newly created source file
@@ -725,12 +800,12 @@ mod tests {
     }
 
     if let Err(e) = Workspace::new(&path.join("Cargo.toml"), config) {
-        let msg = format!(
-            "compiling this new crate may not work due to invalid \
-             workspace configuration\n\n{:?}",
-            e,
+        crate::display_warning_with_error(
+            "compiling this new package may not work due to invalid \
+             workspace configuration",
+            &e,
+            &mut config.shell(),
         );
-        config.shell().warn(msg)?;
     }
 
     Ok(())
@@ -740,16 +815,10 @@ fn get_environment_variable(variables: &[&str]) -> Option<String> {
     variables.iter().filter_map(|var| env::var(var).ok()).next()
 }
 
-fn discover_author() -> CargoResult<(String, Option<String>)> {
-    let cwd = env::current_dir()?;
-    let git_config = if let Ok(repo) = GitRepository::discover(&cwd) {
-        repo.config()
-            .ok()
-            .or_else(|| GitConfig::open_default().ok())
-    } else {
-        GitConfig::open_default().ok()
-    };
+fn discover_author(path: &Path) -> (Option<String>, Option<String>) {
+    let git_config = find_git_config(path);
     let git_config = git_config.as_ref();
+
     let name_variables = [
         "CARGO_NAME",
         "GIT_AUTHOR_NAME",
@@ -762,16 +831,8 @@ fn discover_author() -> CargoResult<(String, Option<String>)> {
         .or_else(|| git_config.and_then(|g| g.get_string("user.name").ok()))
         .or_else(|| get_environment_variable(&name_variables[3..]));
 
-    let name = match name {
-        Some(name) => name,
-        None => {
-            let username_var = if cfg!(windows) { "USERNAME" } else { "USER" };
-            anyhow::bail!(
-                "could not determine the current user, please set ${}",
-                username_var
-            )
-        }
-    };
+    let name = name.map(|namestr| namestr.trim().to_string());
+
     let email_variables = [
         "CARGO_EMAIL",
         "GIT_AUTHOR_EMAIL",
@@ -782,7 +843,6 @@ fn discover_author() -> CargoResult<(String, Option<String>)> {
         .or_else(|| git_config.and_then(|g| g.get_string("user.email").ok()))
         .or_else(|| get_environment_variable(&email_variables[3..]));
 
-    let name = name.trim().to_string();
     let email = email.map(|s| {
         let mut s = s.trim();
 
@@ -795,5 +855,31 @@ fn discover_author() -> CargoResult<(String, Option<String>)> {
         s.to_string()
     });
 
-    Ok((name, email))
+    (name, email)
+}
+
+fn find_git_config(path: &Path) -> Option<GitConfig> {
+    match env::var("__CARGO_TEST_ROOT") {
+        Ok(_) => find_tests_git_config(path),
+        Err(_) => find_real_git_config(path),
+    }
+}
+
+fn find_tests_git_config(path: &Path) -> Option<GitConfig> {
+    // Don't escape the test sandbox when looking for a git repository.
+    // NOTE: libgit2 has support to define the path ceiling in
+    // git_repository_discover, but the git2 bindings do not expose that.
+    for path in paths::ancestors(path, None) {
+        if let Ok(repo) = GitRepository::open(path) {
+            return Some(repo.config().expect("test repo should have valid config"));
+        }
+    }
+    GitConfig::open_default().ok()
+}
+
+fn find_real_git_config(path: &Path) -> Option<GitConfig> {
+    GitRepository::discover(path)
+        .and_then(|repo| repo.config())
+        .or_else(|_| GitConfig::open_default())
+        .ok()
 }
