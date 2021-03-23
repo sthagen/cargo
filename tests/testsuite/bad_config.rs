@@ -94,7 +94,7 @@ fn bad4() {
             ".cargo/config",
             r#"
                 [cargo-new]
-                  name = false
+                  vcs = false
             "#,
         )
         .build();
@@ -105,7 +105,7 @@ fn bad4() {
 [ERROR] Failed to create package `foo` at `[..]`
 
 Caused by:
-  error in [..]config: `cargo-new.name` expected a string, but found a boolean
+  error in [..]config: `cargo-new.vcs` expected a string, but found a boolean
 ",
         )
         .run();
@@ -1309,7 +1309,7 @@ fn bad_debuginfo() {
 error: failed to parse manifest at `[..]`
 
 Caused by:
-  invalid type: string \"a\", expected a boolean or an integer for [..]
+  expected a boolean or an integer for [..]
 ",
         )
         .run();
@@ -1338,7 +1338,7 @@ fn bad_opt_level() {
 error: failed to parse manifest at `[..]`
 
 Caused by:
-  invalid type: integer `3`, expected a boolean or a string for key [..]
+  expected a boolean or a string for key [..]
 ",
         )
         .run();
