@@ -655,9 +655,14 @@ fn env_args(
 }
 
 /// Collection of information about `rustc` and the host and target.
-pub struct RustcTargetData {
+pub struct RustcTargetData<'cfg> {
     /// Information about `rustc` itself.
     pub rustc: Rustc,
+
+    /// Config
+    config: &'cfg Config,
+    requested_kinds: Vec<CompileKind>,
+
     /// Build information for the "host", which is information about when
     /// `rustc` is invoked without a `--target` flag. This is used for
     /// procedural macros, build scripts, etc.
@@ -670,27 +675,17 @@ pub struct RustcTargetData {
     target_info: HashMap<CompileTarget, TargetInfo>,
 }
 
-impl RustcTargetData {
+impl<'cfg> RustcTargetData<'cfg> {
     pub fn new(
-        ws: &Workspace<'_>,
+        ws: &Workspace<'cfg>,
         requested_kinds: &[CompileKind],
-    ) -> CargoResult<RustcTargetData> {
+    ) -> CargoResult<RustcTargetData<'cfg>> {
         let config = ws.config();
         let rustc = config.load_global_rustc(Some(ws))?;
         let host_config = config.target_cfg_triple(&rustc.host)?;
         let host_info = TargetInfo::new(config, requested_kinds, &rustc, CompileKind::Host)?;
         let mut target_config = HashMap::new();
         let mut target_info = HashMap::new();
-        for kind in requested_kinds {
-            if let CompileKind::Target(target) = *kind {
-                let tcfg = config.target_cfg_triple(target.short_name())?;
-                target_config.insert(target, tcfg);
-                target_info.insert(
-                    target,
-                    TargetInfo::new(config, requested_kinds, &rustc, *kind)?,
-                );
-            }
-        }
 
         // This is a hack. The unit_dependency graph builder "pretends" that
         // `CompileKind::Host` is `CompileKind::Target(host)` if the
@@ -703,13 +698,49 @@ impl RustcTargetData {
             target_config.insert(ct, host_config.clone());
         }
 
-        Ok(RustcTargetData {
+        let mut res = RustcTargetData {
             rustc,
+            config,
+            requested_kinds: requested_kinds.into(),
             host_config,
             host_info,
             target_config,
             target_info,
-        })
+        };
+
+        // Get all kinds we currently know about.
+        //
+        // For now, targets can only ever come from the root workspace
+        // units as artifact dependencies are not a thing yet, so this
+        // correctly represents all the kinds that can happen. When we
+        // have artifact dependencies or other ways for targets to
+        // appear at places that are not the root units, we may have
+        // to revisit this.
+        let all_kinds = requested_kinds
+            .iter()
+            .copied()
+            .chain(ws.members().flat_map(|p| {
+                p.manifest()
+                    .default_kind()
+                    .into_iter()
+                    .chain(p.manifest().forced_kind())
+            }));
+        for kind in all_kinds {
+            if let CompileKind::Target(target) = kind {
+                if !res.target_config.contains_key(&target) {
+                    res.target_config
+                        .insert(target, res.config.target_cfg_triple(target.short_name())?);
+                }
+                if !res.target_info.contains_key(&target) {
+                    res.target_info.insert(
+                        target,
+                        TargetInfo::new(res.config, &res.requested_kinds, &res.rustc, kind)?,
+                    );
+                }
+            }
+        }
+
+        Ok(res)
     }
 
     /// Returns a "short" name for the given kind, suitable for keying off
@@ -771,27 +802,6 @@ pub struct RustDocFingerprint {
 }
 
 impl RustDocFingerprint {
-    /// Read the `RustDocFingerprint` info from the fingerprint file.
-    fn read(cx: &Context<'_, '_>) -> CargoResult<Self> {
-        let rustdoc_data = paths::read(&cx.files().host_root().join(".rustdoc_fingerprint.json"))?;
-        serde_json::from_str(&rustdoc_data).map_err(|e| anyhow::anyhow!("{:?}", e))
-    }
-
-    /// Write the `RustDocFingerprint` info into the fingerprint file.
-    fn write<'a, 'cfg>(&self, cx: &Context<'a, 'cfg>) -> CargoResult<()> {
-        paths::write(
-            &cx.files().host_root().join(".rustdoc_fingerprint.json"),
-            serde_json::to_string(&self)?.as_bytes(),
-        )
-    }
-
-    fn remove_doc_dirs(doc_dirs: &[&Path]) -> CargoResult<()> {
-        doc_dirs
-            .iter()
-            .filter(|path| path.exists())
-            .try_for_each(|path| paths::remove_dir_all(&path))
-    }
-
     /// This function checks whether the latest version of `Rustc` used to compile this
     /// `Workspace`'s docs was the same as the one is currently being used in this `cargo doc`
     /// call.
@@ -801,38 +811,81 @@ impl RustDocFingerprint {
     /// versions of the `js/html/css` files that `rustdoc` autogenerates which do not have
     /// any versioning.
     pub fn check_rustdoc_fingerprint(cx: &Context<'_, '_>) -> CargoResult<()> {
+        if cx.bcx.config.cli_unstable().skip_rustdoc_fingerprint {
+            return Ok(());
+        }
         let actual_rustdoc_target_data = RustDocFingerprint {
             rustc_vv: cx.bcx.rustc().verbose_version.clone(),
         };
 
-        // Collect all of the target doc paths for which the docs need to be compiled for.
-        let doc_dirs: Vec<&Path> = cx
-            .bcx
+        let fingerprint_path = cx.files().host_root().join(".rustdoc_fingerprint.json");
+        let write_fingerprint = || -> CargoResult<()> {
+            paths::write(
+                &fingerprint_path,
+                serde_json::to_string(&actual_rustdoc_target_data)?,
+            )
+        };
+        let rustdoc_data = match paths::read(&fingerprint_path) {
+            Ok(rustdoc_data) => rustdoc_data,
+            // If the fingerprint does not exist, do not clear out the doc
+            // directories. Otherwise this ran into problems where projects
+            // like rustbuild were creating the doc directory before running
+            // `cargo doc` in a way that deleting it would break it.
+            Err(_) => return write_fingerprint(),
+        };
+        match serde_json::from_str::<RustDocFingerprint>(&rustdoc_data) {
+            Ok(fingerprint) => {
+                if fingerprint.rustc_vv == actual_rustdoc_target_data.rustc_vv {
+                    return Ok(());
+                } else {
+                    log::debug!(
+                        "doc fingerprint changed:\noriginal:\n{}\nnew:\n{}",
+                        fingerprint.rustc_vv,
+                        actual_rustdoc_target_data.rustc_vv
+                    );
+                }
+            }
+            Err(e) => {
+                log::debug!("could not deserialize {:?}: {}", fingerprint_path, e);
+            }
+        };
+        // Fingerprint does not match, delete the doc directories and write a new fingerprint.
+        log::debug!(
+            "fingerprint {:?} mismatch, clearing doc directories",
+            fingerprint_path
+        );
+        cx.bcx
             .all_kinds
             .iter()
             .map(|kind| cx.files().layout(*kind).doc())
-            .collect();
+            .filter(|path| path.exists())
+            .try_for_each(|path| clean_doc(path))?;
+        write_fingerprint()?;
+        return Ok(());
 
-        // Check wether `.rustdoc_fingerprint.json` exists
-        match Self::read(cx) {
-            Ok(fingerprint) => {
-                // Check if rustc_version matches the one we just used. Otherways,
-                // remove the `doc` folder to trigger a re-compilation of the docs.
-                if fingerprint.rustc_vv != actual_rustdoc_target_data.rustc_vv {
-                    Self::remove_doc_dirs(&doc_dirs)?;
-                    actual_rustdoc_target_data.write(cx)?
+        fn clean_doc(path: &Path) -> CargoResult<()> {
+            let entries = path
+                .read_dir()
+                .with_context(|| format!("failed to read directory `{}`", path.display()))?;
+            for entry in entries {
+                let entry = entry?;
+                // Don't remove hidden files. Rustdoc does not create them,
+                // but the user might have.
+                if entry
+                    .file_name()
+                    .to_str()
+                    .map_or(false, |name| name.starts_with('.'))
+                {
+                    continue;
+                }
+                let path = entry.path();
+                if entry.file_type()?.is_dir() {
+                    paths::remove_dir_all(path)?;
+                } else {
+                    paths::remove_file(path)?;
                 }
             }
-            // If the file does not exist, then we cannot assume that the docs were compiled
-            // with the actual Rustc instance version. Therefore, we try to remove the
-            // `doc` directory forcing the recompilation of the docs. If the directory doesn't
-            // exists neither, we simply do nothing and continue.
-            Err(_) => {
-                // We don't care if this succeeds as explained above.
-                let _ = Self::remove_doc_dirs(&doc_dirs);
-                actual_rustdoc_target_data.write(cx)?
-            }
+            Ok(())
         }
-        Ok(())
     }
 }
