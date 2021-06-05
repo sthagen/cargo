@@ -67,6 +67,10 @@ incremental = true            # whether or not to enable incremental compilation
 dep-info-basedir = "…"        # path for the base directory for targets in depfiles
 pipelining = true             # rustc pipelining
 
+[doc]
+browser = "chromium"          # browser to use with `cargo doc --open`,
+                              # overrides the `BROWSER` environment variable
+
 [cargo-new]
 vcs = "none"              # VCS to use ('git', 'hg', 'pijul', 'fossil', 'none')
 
@@ -345,6 +349,16 @@ Without `--target`, the flags will be passed to all compiler invocations
 you have args that you do not want to pass to build scripts or proc macros and
 are building for the host, pass `--target` with the host triple.
 
+It is not recommended to pass in flags that Cargo itself usually manages. For
+example, the flags driven by [profiles] are best handled by setting the
+appropriate profile setting.
+
+> **Caution**: Due to the low-level nature of passing flags directly to the
+> compiler, this may cause a conflict with future versions of Cargo which may
+> issue the same or similar flags on its own which may interfere with the
+> flags you specify. This is an area where Cargo may not always be backwards
+> compatible.
+
 ##### `build.rustdocflags`
 * Type: string or array of strings
 * Default: none
@@ -395,6 +409,16 @@ directory.
 
 Controls whether or not build pipelining is used. This allows Cargo to
 schedule overlapping invocations of `rustc` in parallel when possible.
+
+#### `[doc]`
+
+The `[doc]` table defines options for the [`cargo doc`] command.
+
+##### `doc.browser`
+
+This option sets the browser to be used by [`cargo doc`], overriding the
+`BROWSER` environment variable when opening documentation with the `--open`
+option.
 
 #### `[cargo-new]`
 
@@ -928,6 +952,7 @@ Sets the width for progress bar.
 
 [`cargo bench`]: ../commands/cargo-bench.md
 [`cargo login`]: ../commands/cargo-login.md
+[`cargo doc`]: ../commands/cargo-doc.md
 [`cargo new`]: ../commands/cargo-new.md
 [`cargo publish`]: ../commands/cargo-publish.md
 [`cargo run`]: ../commands/cargo-run.md

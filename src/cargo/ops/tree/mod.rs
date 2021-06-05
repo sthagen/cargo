@@ -8,7 +8,7 @@ use crate::core::{Package, PackageId, PackageIdSpec, Workspace};
 use crate::ops::{self, Packages};
 use crate::util::{CargoResult, Config};
 use crate::{drop_print, drop_println};
-use anyhow::{bail, Context};
+use anyhow::Context;
 use graph::Graph;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
@@ -43,6 +43,10 @@ pub struct TreeOptions {
     pub format: String,
     /// Includes features in the tree as separate nodes.
     pub graph_features: bool,
+    /// Maximum display depth of the dependency tree.
+    pub max_display_depth: u32,
+    /// Exculdes proc-macro dependencies.
+    pub no_proc_macro: bool,
 }
 
 #[derive(PartialEq)]
@@ -122,9 +126,6 @@ static ASCII_SYMBOLS: Symbols = Symbols {
 
 /// Entry point for the `cargo tree` command.
 pub fn build_and_print(ws: &Workspace<'_>, opts: &TreeOptions) -> CargoResult<()> {
-    if opts.graph_features && opts.duplicates {
-        bail!("the `-e features` flag does not support `--duplicates`");
-    }
     let requested_targets = match &opts.target {
         Target::All | Target::Host => Vec::new(),
         Target::Specific(t) => t.clone(),
@@ -241,6 +242,8 @@ fn print(
             symbols,
             opts.prefix,
             opts.no_dedupe,
+            opts.max_display_depth,
+            opts.no_proc_macro,
             &mut visited_deps,
             &mut levels_continue,
             &mut print_stack,
@@ -259,6 +262,8 @@ fn print_node<'a>(
     symbols: &Symbols,
     prefix: Prefix,
     no_dedupe: bool,
+    max_display_depth: u32,
+    no_proc_macro: bool,
     visited_deps: &mut HashSet<usize>,
     levels_continue: &mut Vec<bool>,
     print_stack: &mut Vec<usize>,
@@ -316,6 +321,8 @@ fn print_node<'a>(
             symbols,
             prefix,
             no_dedupe,
+            max_display_depth,
+            no_proc_macro,
             visited_deps,
             levels_continue,
             print_stack,
@@ -334,6 +341,8 @@ fn print_dependencies<'a>(
     symbols: &Symbols,
     prefix: Prefix,
     no_dedupe: bool,
+    max_display_depth: u32,
+    no_proc_macro: bool,
     visited_deps: &mut HashSet<usize>,
     levels_continue: &mut Vec<bool>,
     print_stack: &mut Vec<usize>,
@@ -362,21 +371,41 @@ fn print_dependencies<'a>(
         }
     }
 
-    let mut it = deps.iter().peekable();
+    let mut it = deps
+        .iter()
+        .filter(|dep| {
+            // Filter out proc-macro dependencies.
+            if no_proc_macro {
+                match graph.node(**dep) {
+                    &Node::Package { package_id, .. } => {
+                        !graph.package_for_id(package_id).proc_macro()
+                    }
+                    _ => true,
+                }
+            } else {
+                true
+            }
+        })
+        .peekable();
+
     while let Some(dependency) = it.next() {
-        levels_continue.push(it.peek().is_some());
-        print_node(
-            config,
-            graph,
-            *dependency,
-            format,
-            symbols,
-            prefix,
-            no_dedupe,
-            visited_deps,
-            levels_continue,
-            print_stack,
-        );
-        levels_continue.pop();
+        if levels_continue.len() + 1 <= max_display_depth as usize {
+            levels_continue.push(it.peek().is_some());
+            print_node(
+                config,
+                graph,
+                *dependency,
+                format,
+                symbols,
+                prefix,
+                no_dedupe,
+                max_display_depth,
+                no_proc_macro,
+                visited_deps,
+                levels_continue,
+                print_stack,
+            );
+            levels_continue.pop();
+        }
     }
 }

@@ -137,11 +137,13 @@ Cargo _or_ Rust features can be used.
 * Tracking Issue: [#9426](https://github.com/rust-lang/cargo/issues/9426)
 * Original Pull Request: [#7811](https://github.com/rust-lang/cargo/pull/7811)
 
-The `-Z extra-link-arg` flag makes the following two instructions available
+The `-Z extra-link-arg` flag makes the following instructions available
 in build scripts:
 
 * [`cargo:rustc-link-arg-bins=FLAG`](#rustc-link-arg-bins) – Passes custom
   flags to a linker for binaries.
+* [`cargo:rustc-link-arg-bin=BIN=FLAG`](#rustc-link-arg-bin) – Passes custom
+  flags to a linker for the binary `BIN`.
 * [`cargo:rustc-link-arg=FLAG`](#rustc-link-arg) – Passes custom flags to a
   linker for benchmarks, binaries, `cdylib` crates, examples, and tests.
 
@@ -151,6 +153,16 @@ in build scripts:
 The `rustc-link-arg-bins` instruction tells Cargo to pass the [`-C
 link-arg=FLAG` option][link-arg] to the compiler, but only when building a
 binary target. Its usage is highly platform specific. It is useful
+to set a linker script or other linker options.
+
+[link-arg]: ../../rustc/codegen-options/index.md#link-arg
+
+<a id="rustc-link-arg-bin"></a>
+#### `cargo:rustc-link-arg-bin=BIN=FLAG`
+
+The `rustc-link-arg-bin` instruction tells Cargo to pass the [`-C
+link-arg=FLAG` option][link-arg] to the compiler, but only when building
+the binary target with name `BIN`. Its usage is highly platform specific. It is useful
 to set a linker script or other linker options.
 
 [link-arg]: ../../rustc/codegen-options/index.md#link-arg
@@ -207,7 +219,7 @@ generated if dev-dependencies are skipped.
 > versions for direct dependencies.
 
 When a `Cargo.lock` file is generated, the `-Z minimal-versions` flag will
-resolve the dependencies to the minimum semver version that will satisfy the
+resolve the dependencies to the minimum SemVer version that will satisfy the
 requirements (instead of the greatest version).
 
 The intended use-case of this flag is to check, during continuous integration,
@@ -693,6 +705,61 @@ cargo +nightly -Zunstable-options -Zconfig-include --config somefile.toml build
 
 CLI paths are relative to the current working directory.
 
+### target-applies-to-host
+* Original Pull Request: [#9322](https://github.com/rust-lang/cargo/pull/9322)
+* Tracking Issue: [#9453](https://github.com/rust-lang/cargo/issues/9453)
+
+The `target-applies-to-host` key in a config file can be used set the desired
+behavior for passing target config flags to build scripts.
+
+It requires the `-Ztarget-applies-to-host` command-line option.
+
+The current default for `target-applies-to-host` is `true`, which will be
+changed to `false` in the future, if `-Zhost-config` is used the new `false`
+default will be set for `target-applies-to-host`.
+
+```toml
+# config.toml
+target-applies-to-host = false
+```
+
+```console
+cargo +nightly -Ztarget-applies-to-host build --target x86_64-unknown-linux-gnu
+```
+
+### host-config
+* Original Pull Request: [#9322](https://github.com/rust-lang/cargo/pull/9322)
+* Tracking Issue: [#9452](https://github.com/rust-lang/cargo/issues/9452)
+
+The `host` key in a config file can be used pass flags to host build targets
+such as build scripts that must run on the host system instead of the target
+system when cross compiling. It supports both generic and host arch specific
+tables. Matching host arch tables take precedence over generic host tables.
+
+It requires the `-Zhost-config` and `-Ztarget-applies-to-host` command-line
+options to be set.
+
+```toml
+# config.toml
+[host]
+linker = "/path/to/host/linker"
+[host.x86_64-unknown-linux-gnu]
+linker = "/path/to/host/arch/linker"
+[target.x86_64-unknown-linux-gnu]
+linker = "/path/to/target/linker"
+```
+
+The generic `host` table above will be entirely ignored when building on a
+`x86_64-unknown-linux-gnu` host as the `host.x86_64-unknown-linux-gnu` table
+takes precedence.
+
+Setting `-Zhost-config` changes the default for `target-applies-to-host` to
+`false` from `true`.
+
+```console
+cargo +nightly -Ztarget-applies-to-host -Zhost-config build --target x86_64-unknown-linux-gnu
+```
+
 ### unit-graph
 * Tracking Issue: [#8002](https://github.com/rust-lang/cargo/issues/8002)
 
@@ -847,7 +914,7 @@ Other possible string values of `strip` are `none`, `symbols`, and `off`. The de
 
 You can also configure this option with the two absolute boolean values
 `true` and `false`. The former enables `strip` at its higher level, `symbols`,
-whilst the later disables `strip` completely.
+while the latter disables `strip` completely.
 
 ### rustdoc-map
 * Tracking Issue: [#8296](https://github.com/rust-lang/cargo/issues/8296)
@@ -1153,7 +1220,7 @@ cargo logout -Z credential-process
 * RFC: [#2495](https://github.com/rust-lang/rfcs/blob/master/text/2495-min-rust-version.md)
 * rustc Tracking Issue: [#65262](https://github.com/rust-lang/rust/issues/65262)
 
-The `-Z rust-version` flag enables the reading the `rust-version` field in the
+The `-Z rust-version` flag enables the reading of the `rust-version` field in the
 Cargo manifest `package` section. This can be used by a package to state a minimal
 version of the compiler required to build the package. An error is generated if
 the version of rustc is older than the stated `rust-version`. The
@@ -1169,6 +1236,7 @@ rust-version = "1.42"
 ```
 
 ### edition 2021
+* Tracking Issue: [rust-lang/rust#85811](https://github.com/rust-lang/rust/issues/85811)
 
 Support for the 2021 [edition] can be enabled by adding the `edition2021`
 unstable feature to the top of `Cargo.toml`:
@@ -1214,6 +1282,7 @@ developers of the dependencies to help resolve the issue.
 
 ### configurable-env
 * Original Pull Request: [#9175](https://github.com/rust-lang/cargo/pull/9175)
+* Tracking Issue: [#9539](https://github.com/rust-lang/cargo/issues/9539)
 
 The `-Z configurable-env` flag enables the `[env]` section in the
 `.cargo/config.toml` file. This section allows you to set additional environment

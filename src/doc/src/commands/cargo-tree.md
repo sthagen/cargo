@@ -71,6 +71,11 @@ flag can be used to display the package's reverse dependencies only with the
 subtree of the package given to <code>-p</code>.</dd>
 
 
+<dt class="option-term" id="option-cargo-tree---depth"><a class="option-anchor" href="#option-cargo-tree---depth"></a><code>--depth</code> <em>depth</em></dt>
+<dd class="option-desc">Maximum display depth of the dependency tree. A depth of 1 displays the direct
+dependencies, for example.</dd>
+
+
 <dt class="option-term" id="option-cargo-tree---no-dedupe"><a class="option-anchor" href="#option-cargo-tree---no-dedupe"></a><code>--no-dedupe</code></dt>
 <dd class="option-desc">Do not de-duplicate repeated dependencies. Usually, when a package has already
 displayed its dependencies, further occurrences will not re-display its
@@ -103,8 +108,10 @@ kind given, then it will automatically include the other dependency kinds.</li>
 <li><code>no-normal</code> — Do not include normal dependencies.</li>
 <li><code>no-build</code> — Do not include build dependencies.</li>
 <li><code>no-dev</code> — Do not include development dependencies.</li>
+<li><code>no-proc-macro</code> — Do not include procedural macro dependencies.</li>
 </ul>
-<p>The <code>no-</code> prefixed options cannot be mixed with the other dependency kinds.</p>
+<p>The <code>normal</code>, <code>build</code>, <code>dev</code>, and <code>all</code> dependency kinds cannot be mixed with
+<code>no-normal</code>, <code>no-build</code>, or <code>no-dev</code> dependency kinds.</p>
 <p>The default is <code>normal,build,dev</code>.</dd>
 
 
