@@ -782,9 +782,6 @@ impl LocalFingerprint {
     }
 }
 
-#[derive(Debug)]
-struct MtimeSlot(Mutex<Option<FileTime>>);
-
 impl Fingerprint {
     fn new() -> Fingerprint {
         Fingerprint {
@@ -1153,37 +1150,6 @@ impl hash::Hash for Fingerprint {
     }
 }
 
-impl hash::Hash for MtimeSlot {
-    fn hash<H: Hasher>(&self, h: &mut H) {
-        self.0.lock().unwrap().hash(h)
-    }
-}
-
-impl ser::Serialize for MtimeSlot {
-    fn serialize<S>(&self, s: S) -> Result<S::Ok, S::Error>
-    where
-        S: ser::Serializer,
-    {
-        self.0
-            .lock()
-            .unwrap()
-            .map(|ft| (ft.unix_seconds(), ft.nanoseconds()))
-            .serialize(s)
-    }
-}
-
-impl<'de> de::Deserialize<'de> for MtimeSlot {
-    fn deserialize<D>(d: D) -> Result<MtimeSlot, D::Error>
-    where
-        D: de::Deserializer<'de>,
-    {
-        let kind: Option<(i64, u32)> = de::Deserialize::deserialize(d)?;
-        Ok(MtimeSlot(Mutex::new(
-            kind.map(|(s, n)| FileTime::from_unix_time(s, n)),
-        )))
-    }
-}
-
 impl DepFingerprint {
     fn new(cx: &mut Context<'_, '_>, parent: &Unit, dep: &UnitDep) -> CargoResult<DepFingerprint> {
         let fingerprint = calculate(cx, &dep.unit)?;
@@ -1354,12 +1320,7 @@ fn calculate_normal(cx: &mut Context<'_, '_>, unit: &Unit) -> CargoResult<Finger
     let metadata = util::hash_u64((&m.authors, &m.description, &m.homepage, &m.repository));
     let mut config = 0u64;
     if unit.mode.is_doc() && cx.bcx.config.cli_unstable().rustdoc_map {
-        config = config.wrapping_add(
-            cx.bcx
-                .config
-                .doc_extern_map()
-                .map_or(0, |map| util::hash_u64(map)),
-        );
+        config = config.wrapping_add(cx.bcx.config.doc_extern_map().map_or(0, util::hash_u64));
     }
     if let Some(allow_features) = &cx.bcx.config.cli_unstable().allow_features {
         config = config.wrapping_add(util::hash_u64(allow_features));

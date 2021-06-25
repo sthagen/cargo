@@ -50,7 +50,7 @@
 //! improved.
 
 use std::cell::Cell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io;
 use std::marker;
 use std::sync::Arc;
@@ -61,8 +61,6 @@ use cargo_util::ProcessBuilder;
 use crossbeam_utils::thread::Scope;
 use jobserver::{Acquired, Client, HelperThread};
 use log::{debug, info, trace};
-use rand::distributions::Alphanumeric;
-use rand::{thread_rng, Rng};
 
 use super::context::OutputFile;
 use super::job::{
@@ -72,11 +70,12 @@ use super::job::{
 use super::timings::Timings;
 use super::{BuildContext, BuildPlan, CompileMode, Context, Unit};
 use crate::core::compiler::future_incompat::{
-    FutureBreakageItem, OnDiskReport, FUTURE_INCOMPAT_FILE,
+    FutureBreakageItem, FutureIncompatReportPackage, OnDiskReports,
 };
-use crate::core::{PackageId, Shell, TargetKind};
-use crate::drop_eprint;
+use crate::core::resolver::ResolveBehavior;
+use crate::core::{FeatureValue, PackageId, Shell, TargetKind};
 use crate::util::diagnostic_server::{self, DiagnosticPrinter};
+use crate::util::interning::InternedString;
 use crate::util::machine_message::{self, Message as _};
 use crate::util::CargoResult;
 use crate::util::{self, internal, profile};
@@ -158,7 +157,7 @@ struct DrainState<'cfg> {
 
     /// How many jobs we've finished
     finished: usize,
-    per_crate_future_incompat_reports: Vec<FutureIncompatReportCrate>,
+    per_package_future_incompat_reports: Vec<FutureIncompatReportPackage>,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -168,11 +167,6 @@ impl std::fmt::Display for JobId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
-}
-
-struct FutureIncompatReportCrate {
-    package_id: PackageId,
-    report: Vec<FutureBreakageItem>,
 }
 
 /// A `JobState` is constructed by `JobQueue::run` and passed to `Job::run`. It includes everything
@@ -277,7 +271,7 @@ impl<'a> JobState<'a> {
     pub fn stderr(&self, stderr: String) -> CargoResult<()> {
         if let Some(config) = self.output {
             let mut shell = config.shell();
-            shell.print_ansi(stderr.as_bytes())?;
+            shell.print_ansi_stderr(stderr.as_bytes())?;
             shell.err().write_all(b"\n")?;
         } else {
             self.messages.push_bounded(Message::Stderr(stderr));
@@ -429,7 +423,7 @@ impl<'cfg> JobQueue<'cfg> {
             pending_queue: Vec::new(),
             print: DiagnosticPrinter::new(cx.bcx.config),
             finished: 0,
-            per_crate_future_incompat_reports: Vec::new(),
+            per_package_future_incompat_reports: Vec::new(),
         };
 
         // Create a helper thread for acquiring jobserver tokens
@@ -566,7 +560,7 @@ impl<'cfg> DrainState<'cfg> {
             }
             Message::Stderr(err) => {
                 let mut shell = cx.bcx.config.shell();
-                shell.print_ansi(err.as_bytes())?;
+                shell.print_ansi_stderr(err.as_bytes())?;
                 shell.err().write_all(b"\n")?;
             }
             Message::FixDiagnostic(msg) => {
@@ -607,14 +601,15 @@ impl<'cfg> DrainState<'cfg> {
                     Err(e) => {
                         let msg = "The following warnings were emitted during compilation:";
                         self.emit_warnings(Some(msg), &unit, cx)?;
+                        self.back_compat_notice(cx, &unit)?;
                         return Err(e);
                     }
                 }
             }
-            Message::FutureIncompatReport(id, report) => {
+            Message::FutureIncompatReport(id, items) => {
                 let package_id = self.active[&id].pkg.package_id();
-                self.per_crate_future_incompat_reports
-                    .push(FutureIncompatReportCrate { package_id, report });
+                self.per_package_future_incompat_reports
+                    .push(FutureIncompatReportPackage { package_id, items });
             }
             Message::Token(acquired_token) => {
                 let token = acquired_token.with_context(|| "failed to acquire jobserver token")?;
@@ -797,7 +792,7 @@ impl<'cfg> DrainState<'cfg> {
             if !cx.bcx.build_config.build_plan {
                 // It doesn't really matter if this fails.
                 drop(cx.bcx.config.shell().status("Finished", message));
-                self.emit_future_incompat(cx);
+                self.emit_future_incompat(cx.bcx);
             }
 
             None
@@ -807,93 +802,57 @@ impl<'cfg> DrainState<'cfg> {
         }
     }
 
-    fn emit_future_incompat(&mut self, cx: &mut Context<'_, '_>) {
-        if cx.bcx.config.cli_unstable().future_incompat_report {
-            if self.per_crate_future_incompat_reports.is_empty() {
+    fn emit_future_incompat(&mut self, bcx: &BuildContext<'_, '_>) {
+        if !bcx.config.cli_unstable().future_incompat_report {
+            return;
+        }
+        if self.per_package_future_incompat_reports.is_empty() {
+            if bcx.build_config.future_incompat_report {
                 drop(
-                    cx.bcx
-                        .config
+                    bcx.config
                         .shell()
-                        .note("0 dependencies had future-incompat warnings"),
+                        .note("0 dependencies had future-incompatible warnings"),
                 );
-                return;
             }
-            self.per_crate_future_incompat_reports
-                .sort_by_key(|r| r.package_id);
+            return;
+        }
 
-            let crates_and_versions = self
-                .per_crate_future_incompat_reports
-                .iter()
-                .map(|r| r.package_id.to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
+        // Get a list of unique and sorted package name/versions.
+        let package_vers: BTreeSet<_> = self
+            .per_package_future_incompat_reports
+            .iter()
+            .map(|r| r.package_id)
+            .collect();
+        let package_vers: Vec<_> = package_vers
+            .into_iter()
+            .map(|pid| pid.to_string())
+            .collect();
 
-            drop(cx.bcx.config.shell().warn(&format!(
-                "the following crates contain code that will be rejected by a future version of Rust: {}",
-                crates_and_versions
+        drop(bcx.config.shell().warn(&format!(
+            "the following packages contain code that will be rejected by a future \
+             version of Rust: {}",
+            package_vers.join(", ")
+        )));
+
+        let on_disk_reports =
+            OnDiskReports::save_report(bcx.ws, &self.per_package_future_incompat_reports);
+        let report_id = on_disk_reports.last_id();
+
+        if bcx.build_config.future_incompat_report {
+            let rendered = on_disk_reports.get_report(report_id, bcx.config).unwrap();
+            drop(bcx.config.shell().print_ansi_stderr(rendered.as_bytes()));
+            drop(bcx.config.shell().note(&format!(
+                "this report can be shown with `cargo report \
+                 future-incompatibilities -Z future-incompat-report --id {}`",
+                report_id
             )));
-
-            let mut full_report = String::new();
-            let mut rng = thread_rng();
-
-            // Generate a short ID to allow detecting if a report gets overwritten
-            let id: String = std::iter::repeat(())
-                .map(|()| char::from(rng.sample(Alphanumeric)))
-                .take(4)
-                .collect();
-
-            for report in std::mem::take(&mut self.per_crate_future_incompat_reports) {
-                full_report.push_str(&format!(
-                    "The crate `{}` currently triggers the following future incompatibility lints:\n",
-                    report.package_id
-                ));
-                for item in report.report {
-                    let rendered = if cx.bcx.config.shell().err_supports_color() {
-                        item.diagnostic.rendered
-                    } else {
-                        strip_ansi_escapes::strip(&item.diagnostic.rendered)
-                            .map(|v| String::from_utf8(v).expect("utf8"))
-                            .expect("strip should never fail")
-                    };
-
-                    for line in rendered.lines() {
-                        full_report.push_str(&format!("> {}\n", line));
-                    }
-                }
-            }
-
-            let report_file = cx.bcx.ws.target_dir().open_rw(
-                FUTURE_INCOMPAT_FILE,
-                cx.bcx.config,
-                "Future incompatibility report",
-            );
-            let err = report_file
-                .and_then(|report_file| {
-                    let on_disk_report = OnDiskReport {
-                        id: id.clone(),
-                        report: full_report.clone(),
-                    };
-                    serde_json::to_writer(report_file, &on_disk_report).map_err(|e| e.into())
-                })
-                .err();
-            if let Some(e) = err {
-                crate::display_warning_with_error(
-                    "failed to write on-disk future incompat report",
-                    &e,
-                    &mut cx.bcx.config.shell(),
-                );
-            }
-
-            if cx.bcx.build_config.future_incompat_report {
-                drop_eprint!(cx.bcx.config, "{}", full_report);
-                drop(cx.bcx.config.shell().note(
-                    &format!("this report can be shown with `cargo report future-incompatibilities -Z future-incompat-report --id {}`", id)
-                ));
-            } else {
-                drop(cx.bcx.config.shell().note(
-                    &format!("to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id {}`", id)
-                ));
-            }
+        } else {
+            drop(bcx.config.shell().note(&format!(
+                "to see what the problems were, use the option \
+                 `--future-incompat-report`, or run `cargo report \
+                 future-incompatibilities --id {}`",
+                report_id
+            )));
         }
     }
 
@@ -1152,6 +1111,60 @@ impl<'cfg> DrainState<'cfg> {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn back_compat_notice(&self, cx: &Context<'_, '_>, unit: &Unit) -> CargoResult<()> {
+        if unit.pkg.name() != "diesel"
+            || unit.pkg.version().major != 1
+            || cx.bcx.ws.resolve_behavior() == ResolveBehavior::V1
+            || !unit.pkg.package_id().source_id().is_registry()
+            || !unit.features.is_empty()
+        {
+            return Ok(());
+        }
+        let other_diesel = match cx
+            .bcx
+            .unit_graph
+            .keys()
+            .find(|unit| unit.pkg.name() == "diesel" && !unit.features.is_empty())
+        {
+            Some(u) => u,
+            // Unlikely due to features.
+            None => return Ok(()),
+        };
+        let mut features_suggestion: BTreeSet<_> = other_diesel.features.iter().collect();
+        let fmap = other_diesel.pkg.summary().features();
+        // Remove any unnecessary features.
+        for feature in &other_diesel.features {
+            if let Some(feats) = fmap.get(feature) {
+                for feat in feats {
+                    if let FeatureValue::Feature(f) = feat {
+                        features_suggestion.remove(&f);
+                    }
+                }
+            }
+        }
+        features_suggestion.remove(&InternedString::new("default"));
+        let features_suggestion = toml::to_string(&features_suggestion).unwrap();
+
+        cx.bcx.config.shell().note(&format!(
+            "\
+This error may be due to an interaction between diesel and Cargo's new
+feature resolver. Some workarounds you may want to consider:
+- Add a build-dependency in Cargo.toml on diesel to force Cargo to add the appropriate
+  features. This may look something like this:
+
+    [build-dependencies]
+    diesel = {{ version = \"{}\", features = {} }}
+
+- Try using the previous resolver by setting `resolver = \"1\"` in `Cargo.toml`
+  (see <https://doc.rust-lang.org/cargo/reference/resolver.html#resolver-versions>
+  for more information).
+",
+            unit.pkg.version(),
+            features_suggestion
+        ))?;
         Ok(())
     }
 }

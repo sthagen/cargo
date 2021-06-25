@@ -568,7 +568,7 @@ pub fn create_bcx<'a, 'cfg>(
             // the target is a binary. Binary crates get their private items
             // documented by default.
             if rustdoc_document_private_items || unit.target.is_bin() {
-                let mut args = extra_args.take().unwrap_or_else(|| vec![]);
+                let mut args = extra_args.take().unwrap_or_default();
                 args.push("--document-private-items".into());
                 extra_args = Some(args);
             }
@@ -1140,9 +1140,61 @@ fn generate_targets(
         // else, silently skip target.
     }
     let mut units: Vec<_> = units.into_iter().collect();
+    unmatched_target_filters(&units, filter, &mut ws.config().shell())?;
+
     // Keep the roots in a consistent order, which helps with checking test output.
     units.sort_unstable();
     Ok(units)
+}
+
+/// Checks if the unit list is empty and the user has passed any combination of
+/// --tests, --examples, --benches or --bins, and we didn't match on any targets.
+/// We want to emit a warning to make sure the user knows that this run is a no-op,
+/// and their code remains unchecked despite cargo not returning any errors
+fn unmatched_target_filters(
+    units: &[Unit],
+    filter: &CompileFilter,
+    shell: &mut Shell,
+) -> CargoResult<()> {
+    if let CompileFilter::Only {
+        all_targets,
+        lib: _,
+        ref bins,
+        ref examples,
+        ref tests,
+        ref benches,
+    } = *filter
+    {
+        if units.is_empty() {
+            let mut filters = String::new();
+            let mut miss_count = 0;
+
+            let mut append = |t: &FilterRule, s| {
+                if let FilterRule::All = *t {
+                    miss_count += 1;
+                    filters.push_str(s);
+                }
+            };
+
+            if all_targets {
+                filters.push_str(" `all-targets`");
+            } else {
+                append(bins, " `bins`,");
+                append(tests, " `tests`,");
+                append(examples, " `examples`,");
+                append(benches, " `benches`,");
+                filters.pop();
+            }
+
+            return shell.warn(format!(
+                "Target {}{} specified, but no targets matched. This is a no-op",
+                if miss_count > 1 { "filters" } else { "filter" },
+                filters,
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Warns if a target's required-features references a feature that doesn't exist.
@@ -1173,10 +1225,7 @@ fn validate_required_features(
                     ))?;
                 }
             }
-            FeatureValue::Dep { .. }
-            | FeatureValue::DepFeature {
-                dep_prefix: true, ..
-            } => {
+            FeatureValue::Dep { .. } => {
                 anyhow::bail!(
                     "invalid feature `{}` in required-features of target `{}`: \
                     `dep:` prefixed feature values are not allowed in required-features",
@@ -1196,7 +1245,6 @@ fn validate_required_features(
             FeatureValue::DepFeature {
                 dep_name,
                 dep_feature,
-                dep_prefix: false,
                 weak: false,
             } => {
                 match resolve

@@ -517,61 +517,6 @@ syntax in the features table, so it does not have an implicit feature with that 
 }
 
 #[cargo_test]
-fn crate_feature_explicit() {
-    // dep:name/feature syntax shouldn't set implicit feature.
-    Package::new("bar", "1.0.0")
-        .file(
-            "src/lib.rs",
-            r#"
-                #[cfg(not(feature="feat"))]
-                compile_error!{"feat missing"}
-            "#,
-        )
-        .feature("feat", &[])
-        .publish();
-    let p = project()
-        .file(
-            "Cargo.toml",
-            r#"
-                [package]
-                name = "foo"
-                version = "0.1.0"
-
-                [dependencies]
-                bar = {version = "1.0", optional=true}
-
-                [features]
-                f1 = ["dep:bar/feat"]
-            "#,
-        )
-        .file(
-            "src/lib.rs",
-            r#"
-                #[cfg(not(feature="f1"))]
-                compile_error!{"f1 missing"}
-
-                #[cfg(feature="bar")]
-                compile_error!{"bar should not be set"}
-            "#,
-        )
-        .build();
-
-    p.cargo("check -Z namespaced-features --features f1")
-        .masquerade_as_nightly_cargo()
-        .with_stderr(
-            "\
-[UPDATING] [..]
-[DOWNLOADING] crates ...
-[DOWNLOADED] bar v1.0.0 [..]
-[CHECKING] bar v1.0.0
-[CHECKING] foo v0.1.0 [..]
-[FINISHED] [..]
-",
-        )
-        .run();
-}
-
-#[cargo_test]
 fn crate_syntax_bad_name() {
     // "dep:bar" = []
     Package::new("bar", "1.0.0").publish();
@@ -766,6 +711,7 @@ fn json_exposed() {
                       "publish": null,
                       "authors": [],
                       "categories": [],
+                      "default_run": null,
                       "keywords": [],
                       "readme": null,
                       "repository": null,
@@ -903,7 +849,6 @@ fn tree() {
 
                 [features]
                 a = ["bar/feat2"]
-                b = ["dep:bar/feat2"]
                 bar = ["dep:bar"]
             "#,
         )
@@ -945,38 +890,6 @@ bar v1.0.0
 │   └── foo v0.1.0 ([ROOT]/foo) (*)
 └── bar feature \"feat2\"
     └── foo feature \"a\" (command-line)
-",
-        )
-        .run();
-
-    p.cargo("tree -e features --features b -Z namespaced-features")
-        .masquerade_as_nightly_cargo()
-        .with_stdout(
-            "\
-foo v0.1.0 ([ROOT]/foo)
-├── bar feature \"default\"
-│   └── bar v1.0.0
-│       └── baz feature \"default\"
-│           └── baz v1.0.0
-└── bar feature \"feat1\"
-    └── bar v1.0.0 (*)
-",
-        )
-        .run();
-
-    p.cargo("tree -e features --features b -i bar -Z namespaced-features")
-        .masquerade_as_nightly_cargo()
-        .with_stdout(
-            "\
-bar v1.0.0
-├── bar feature \"default\"
-│   └── foo v0.1.0 ([ROOT]/foo)
-│       ├── foo feature \"b\" (command-line)
-│       └── foo feature \"default\" (command-line)
-├── bar feature \"feat1\"
-│   └── foo v0.1.0 ([ROOT]/foo) (*)
-└── bar feature \"feat2\"
-    └── foo feature \"b\" (command-line)
 ",
         )
         .run();
@@ -1150,7 +1063,8 @@ fn publish_no_implicit() {
         &["Cargo.toml", "Cargo.toml.orig", "src/lib.rs"],
         &[(
             "Cargo.toml",
-            r#"[..]
+            &format!(
+                r#"{}
 [package]
 name = "foo"
 version = "0.1.0"
@@ -1168,6 +1082,8 @@ optional = true
 [features]
 feat = ["opt-dep1"]
 "#,
+                cargo::core::package::MANIFEST_PREAMBLE
+            ),
         )],
     );
 }
@@ -1254,7 +1170,8 @@ fn publish() {
         &["Cargo.toml", "Cargo.toml.orig", "src/lib.rs"],
         &[(
             "Cargo.toml",
-            r#"[..]
+            &format!(
+                r#"{}
 [package]
 name = "foo"
 version = "0.1.0"
@@ -1270,6 +1187,8 @@ feat1 = []
 feat2 = ["dep:bar"]
 feat3 = ["feat2"]
 "#,
+                cargo::core::package::MANIFEST_PREAMBLE
+            ),
         )],
     );
 }
