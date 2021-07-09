@@ -28,7 +28,7 @@ fn do_not_fix_broken_builds() {
     p.cargo("fix --allow-no-vcs")
         .env("__CARGO_FIX_YOLO", "1")
         .with_status(101)
-        .with_stderr_contains("[ERROR] could not compile `foo`")
+        .with_stderr_contains("[ERROR] could not compile `foo` due to previous error")
         .run();
     assert!(p.read_file("src/lib.rs").contains("let mut x = 3;"));
 }
@@ -833,8 +833,6 @@ fn prepare_for_unstable() {
 [ERROR] cannot migrate src/lib.rs to edition {next}
 Edition {next} is unstable and not allowed in this release, consider trying the nightly release channel.
 error: could not compile `foo`
-
-To learn more, run the command again with --verbose.
 ", next=next))
         .run();
 
@@ -1431,8 +1429,9 @@ fn edition_v2_resolver_report() {
     }
     Package::new("common", "1.0.0")
         .feature("f1", &[])
-        .file("src/lib.rs", "")
+        .add_dep(Dependency::new("opt_dep", "1.0").optional(true))
         .publish();
+    Package::new("opt_dep", "1.0.0").publish();
 
     Package::new("bar", "1.0.0")
         .add_dep(
@@ -1454,6 +1453,9 @@ fn edition_v2_resolver_report() {
                 [dependencies]
                 common = "1.0"
                 bar = "1.0"
+
+                [build-dependencies]
+                common = { version = "1.0", features = ["opt_dep"] }
             "#,
         )
         .file("src/lib.rs", "")
@@ -1466,13 +1468,16 @@ fn edition_v2_resolver_report() {
 [DOWNLOADING] crates ...
 [DOWNLOADED] common v1.0.0 [..]
 [DOWNLOADED] bar v1.0.0 [..]
+[DOWNLOADED] opt_dep v1.0.0 [..]
 note: Switching to Edition 2021 will enable the use of the version 2 feature resolver in Cargo.
-This may cause dependencies to resolve with a different set of features.
-More information about the resolver changes may be found at https://doc.rust-lang.org/cargo/reference/features.html#feature-resolver-version-2
-The following differences were detected with the current configuration:
+This may cause some dependencies to be built with fewer features enabled than previously.
+More information about the resolver changes may be found at https://doc.rust-lang.org/nightly/edition-guide/rust-2021/default-cargo-resolver.html
+When building the following dependencies, the given features will no longer be used:
 
-  common v1.0.0 removed features `f1`
+  common v1.0.0: f1, opt_dep
+  common v1.0.0 (as host dependency): f1
 
+[CHECKING] opt_dep v1.0.0
 [CHECKING] common v1.0.0
 [CHECKING] bar v1.0.0
 [CHECKING] foo v0.1.0 [..]
@@ -1503,6 +1508,7 @@ fn rustfix_handles_multi_spans() {
 }
 
 #[cargo_test]
+#[ignore] // Broken, see https://github.com/rust-lang/rust/pull/86009
 fn fix_edition_2021() {
     // Can migrate 2021, even when lints are allowed.
     if !is_nightly() {
