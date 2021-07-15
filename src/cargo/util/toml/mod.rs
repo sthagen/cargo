@@ -1707,14 +1707,11 @@ impl<P: ResolveToPath> DetailedTomlDependency<P> {
         kind: Option<DepKind>,
     ) -> CargoResult<Dependency> {
         if self.version.is_none() && self.path.is_none() && self.git.is_none() {
-            let msg = format!(
+            bail!(
                 "dependency ({}) specified without \
-                 providing a local path, Git repository, or \
-                 version to use. This will be considered an \
-                 error in future versions",
+                 providing a local path, Git repository, or version to use.",
                 name_in_toml
             );
-            cx.warnings.push(msg);
         }
 
         if let Some(version) = &self.version {
@@ -1737,12 +1734,11 @@ impl<P: ResolveToPath> DetailedTomlDependency<P> {
 
             for &(key, key_name) in &git_only_keys {
                 if key.is_some() {
-                    let msg = format!(
-                        "key `{}` is ignored for dependency ({}). \
-                         This will be considered an error in future versions",
-                        key_name, name_in_toml
+                    bail!(
+                        "key `{}` is ignored for dependency ({}).",
+                        key_name,
+                        name_in_toml
                     );
-                    cx.warnings.push(msg)
                 }
             }
         }
@@ -1794,13 +1790,11 @@ impl<P: ResolveToPath> DetailedTomlDependency<P> {
             ),
             (Some(git), maybe_path, _, _) => {
                 if maybe_path.is_some() {
-                    let msg = format!(
+                    bail!(
                         "dependency ({}) specification is ambiguous. \
-                         Only one of `git` or `path` is allowed. \
-                         This will be considered an error in future versions",
+                         Only one of `git` or `path` is allowed.",
                         name_in_toml
                     );
-                    cx.warnings.push(msg)
                 }
 
                 let n_details = [&self.branch, &self.tag, &self.rev]
